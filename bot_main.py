@@ -201,6 +201,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ AI와 통신 중 오류가 발생했습니다.")
 
 
+async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """현재까지 사용한 API 토큰 및 예상 요금 출력"""
+    if not ai_processor:
+        await update.message.reply_text("❌ AI Processor가 설정되지 않았습니다.")
+        return
+        
+    stats = ai_processor.get_usage_stats()
+    in_tokens = stats.get("input_tokens", 0)
+    out_tokens = stats.get("output_tokens", 0)
+    
+    # Gemini Pro Pay-as-you-go pricing (approx):
+    # Input: $1.25 / 1M tokens
+    # Output: $5.00 / 1M tokens
+    cost = (in_tokens / 1_000_000) * 1.25 + (out_tokens / 1_000_000) * 5.00
+    
+    msg = (
+        f"📊 **현재까지 봇 누적 API 사용량**\n\n"
+        f"🔹 입력 토큰: {in_tokens:,} 개\n"
+        f"🔸 출력 토큰: {out_tokens:,} 개\n\n"
+        f"💸 **예상 지출 요금:** 약 ${cost:.4f}\n"
+        f"*(※ 이 요금은 자체 기록한 토큰을 바탕으로 한 단순 추산치이며, 구글 클라우드의 실제 청구액과 다를 수 있습니다.)*"
+    )
+    await update.message.reply_text(msg, parse_mode='Markdown')
+
+
 def main():
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN is not set in .env")
@@ -213,6 +238,7 @@ def main():
     application.add_handler(CommandHandler("reset", reset_command))
     application.add_handler(CommandHandler("new", reset_command))
     application.add_handler(CommandHandler("post", post_command))
+    application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # 스케줄러를 백그라운드 스레드에서 실행
