@@ -10,7 +10,18 @@ class AIProcessor:
         if not api_key:
             raise ValueError("GEMINI_API_KEY is not set in environment variables.")
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-2.5-pro')
+        
+        # 할루시네이션(환각)을 줄이기 위해 temperature 낮춤
+        generation_config = genai.types.GenerationConfig(
+            temperature=0.2,
+            top_p=0.8,
+            top_k=40
+        )
+        self.model = genai.GenerativeModel(
+            'gemini-2.5-pro',
+            generation_config=generation_config,
+            system_instruction="당신은 사실 기반으로만 말하는 정확한 어시스턴트입니다. 사용자에게 제공받은 정보 외에 임의의 사실을 절대 지어내지 마세요."
+        )
         self.chat_session = None
         self.usage_file = os.path.join(os.path.dirname(__file__), "api_usage.json")
         self._init_usage_stats()
