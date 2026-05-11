@@ -1,4 +1,5 @@
 import os
+import glob
 import logging
 import asyncio
 import schedule
@@ -252,6 +253,86 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode='Markdown')
 
 
+async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """로컬 블로그 폴더를 스캔하여 번역이 안 된 글을 번역하고 푸시합니다."""
+    await update.message.reply_text("🔄 블로그 폴더 스캔을 시작합니다...")
+    
+    if not ai_processor or not github_uploader:
+        await update.message.reply_text("❌ AI Processor 또는 Github Uploader가 설정되지 않았습니다.")
+        return
+        
+    blog_dir = "/source/uoosnn.github.io/blog"
+    en_dir = "/source/uoosnn.github.io/en/blog"
+    ja_dir = "/source/uoosnn.github.io/ja/blog"
+    
+    os.makedirs(en_dir, exist_ok=True)
+    os.makedirs(ja_dir, exist_ok=True)
+    
+    md_files = glob.glob(os.path.join(blog_dir, "*.md"))
+    needs_sync = []
+    
+    for file_path in md_files:
+        filename = os.path.basename(file_path)
+        if filename == "index.md":
+            continue
+            
+        kr_mtime = os.path.getmtime(file_path)
+        
+        en_path = os.path.join(en_dir, filename)
+        ja_path = os.path.join(ja_dir, filename)
+        
+        # 번역본이 없거나 한국어 원본보다 오래된 경우 (여유 2초)
+        is_en_outdated = not os.path.exists(en_path) or (kr_mtime > os.path.getmtime(en_path) + 2)
+        is_ja_outdated = not os.path.exists(ja_path) or (kr_mtime > os.path.getmtime(ja_path) + 2)
+        
+        if is_en_outdated or is_ja_outdated:
+            needs_sync.append((file_path, filename))
+            
+    if not needs_sync:
+        await update.message.reply_text("✅ 모든 포스트가 이미 동기화(번역)되어 있습니다.")
+        return
+        
+    await update.message.reply_text(f"📝 총 {len(needs_sync)}개의 문서가 발견되었습니다. 번역 및 동기화를 진행합니다. 잠시만 기다려주세요...")
+    
+    for file_path, filename in needs_sync:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            
+            content_en = ai_processor.translate_blog_post(content, "English")
+            content_ja = ai_processor.translate_blog_post(content, "Japanese")
+            
+            en_path = os.path.join(en_dir, filename)
+            ja_path = os.path.join(ja_dir, filename)
+            
+            with open(en_path, "w", encoding="utf-8") as f:
+                f.write(content_en)
+                
+            with open(ja_path, "w", encoding="utf-8") as f:
+                f.write(content_ja)
+                
+        except Exception as e:
+            logger.error(f"Error syncing {filename}: {e}")
+            await update.message.reply_text(f"❌ {filename} 동기화 중 오류 발생: {e}")
+            return
+            
+    # Commit and Push
+    try:
+        import subprocess
+        subprocess.run(["git", "add", "."], cwd="/source/uoosnn.github.io", check=True)
+        # 변경사항이 없을 수도 있으므로 (git commit은 에러가 날 수 있음)
+        result = subprocess.run(["git", "status", "--porcelain"], cwd="/source/uoosnn.github.io", capture_output=True, text=True)
+        if result.stdout.strip():
+            subprocess.run(["git", "commit", "-m", "docs: Auto translate manual post via /sync"], cwd="/source/uoosnn.github.io", check=True)
+            subprocess.run(["git", "push"], cwd="/source/uoosnn.github.io", check=True)
+            await update.message.reply_text(f"✅ 총 {len(needs_sync)}개의 문서 다국어 번역 및 배포가 완료되었습니다!")
+        else:
+            await update.message.reply_text("✅ 깃허브에 반영할 새로운 변경사항이 없습니다.")
+    except Exception as e:
+        logger.error(f"Error pushing synced files: {e}")
+        await update.message.reply_text(f"❌ 깃허브 업로드 실패: {str(e)}")
+
+
 def main():
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN is not set in .env")
@@ -265,6 +346,7 @@ def main():
     application.add_handler(CommandHandler("new", reset_command))
     application.add_handler(CommandHandler("post", post_command))
     application.add_handler(CommandHandler("usage", usage_command))
+    application.add_handler(CommandHandler("sync", sync_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # 스케줄러를 백그라운드 스레드에서 실행
