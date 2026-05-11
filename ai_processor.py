@@ -1,6 +1,8 @@
 import os
+import json
 import google.generativeai as genai
-from datetime import datetime
+from google.api_core.exceptions import ResourceExhausted
+from datetime import datetime, timedelta
 
 class AIProcessor:
     def __init__(self):
@@ -10,7 +12,50 @@ class AIProcessor:
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel('gemini-2.5-pro')
         self.chat_session = None
+        self.usage_file = os.path.join(os.path.dirname(__file__), "api_usage.json")
+        self._init_usage_stats()
         self.start_new_session()
+
+    def _init_usage_stats(self):
+        if not os.path.exists(self.usage_file):
+            with open(self.usage_file, 'w', encoding='utf-8') as f:
+                json.dump({"input_tokens": 0, "output_tokens": 0}, f)
+
+    def _record_usage(self, response):
+        try:
+            if hasattr(response, 'usage_metadata'):
+                in_tokens = response.usage_metadata.prompt_token_count
+                out_tokens = response.usage_metadata.candidates_token_count
+                
+                with open(self.usage_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                data["input_tokens"] += in_tokens
+                data["output_tokens"] += out_tokens
+                
+                with open(self.usage_file, 'w', encoding='utf-8') as f:
+                    json.dump(data, f)
+        except Exception:
+            pass
+
+    def get_usage_stats(self):
+        try:
+            with open(self.usage_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {"input_tokens": 0, "output_tokens": 0}
+
+    def _generate_content_with_tracking(self, prompt):
+        try:
+            response = self.model.generate_content(prompt)
+            self._record_usage(response)
+            return response
+        except ResourceExhausted:
+            raise Exception("API 지출 한도를 초과했습니다 (Quota Exceeded).")
+        except Exception as e:
+            if "429" in str(e) or "quota" in str(e).lower():
+                raise Exception("API 지출 한도를 초과했습니다 (Quota Exceeded).")
+            raise e
 
     def start_new_session(self):
         """새로운 대화 세션을 시작합니다 (기존 문맥 초기화)."""
@@ -24,8 +69,13 @@ class AIProcessor:
         
         try:
             response = self.chat_session.send_message(message)
+            self._record_usage(response)
             return response.text.strip()
+        except ResourceExhausted:
+            return "❌ API 지출 한도를 초과했습니다 (Quota Exceeded)."
         except Exception as e:
+            if "429" in str(e) or "quota" in str(e).lower():
+                return "❌ API 지출 한도를 초과했습니다 (Quota Exceeded)."
             return f"❌ 오류가 발생했습니다: {str(e)}"
 
     def generate_blog_post_from_history(self, title_instruction):
@@ -61,12 +111,11 @@ class AIProcessor:
 [대화 기록]
 {history_text}
 """
-        response = self.model.generate_content(prompt)
+        response = self._generate_content_with_tracking(prompt)
         return response.text.strip()
 
     def generate_blog_from_news(self, news_data, user_comment):
         """뉴스 원본 데이터와 사용자의 코멘트를 바탕으로 블로그 포스트 생성"""
-        from datetime import timedelta
         kst_now = datetime.utcnow() + timedelta(hours=9)
         prompt = f"""
 당신은 기술 및 게임 트렌드 블로그 전문 에디터입니다.
@@ -91,7 +140,7 @@ class AIProcessor:
 ---
 *게시된 시간: {kst_now.strftime('%Y-%m-%d %H:%M:%S')}*
 """
-        response = self.model.generate_content(prompt)
+        response = self._generate_content_with_tracking(prompt)
         return response.text.strip()
 
     def translate_blog_post(self, markdown_text, target_language):
@@ -109,7 +158,7 @@ class AIProcessor:
 [원본 마크다운]
 {markdown_text}
 """
-        response = self.model.generate_content(prompt)
+        response = self._generate_content_with_tracking(prompt)
         # 번역본에서도 백틱 래퍼가 있다면 제거
         translated = response.text.strip()
         if translated.startswith("```markdown"):
