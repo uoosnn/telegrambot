@@ -134,7 +134,12 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         markdown_content = ai_processor.generate_blog_post_from_history(title_instruction)
-        success, result = github_uploader.save_and_push(markdown_content, title=title_instruction)
+        
+        await update.message.reply_text("🌐 영문 및 일문으로 자동 번역을 수행 중입니다...")
+        content_en = ai_processor.translate_blog_post(markdown_content, "English")
+        content_ja = ai_processor.translate_blog_post(markdown_content, "Japanese")
+        
+        success, result = github_uploader.save_and_push(markdown_content, title=title_instruction, translations={'en': content_en, 'ja': content_ja})
         
         if success:
             await update.message.reply_text(f"✅ 블로그 포스팅 성공!\n\n저장 경로: {result}")
@@ -169,8 +174,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # 블로그 마크다운 생성 (게시된 시간 포함)
                 markdown_content = ai_processor.generate_blog_from_news(news_info, user_text)
                 
+                await update.message.reply_text("🌐 영문 및 일문으로 자동 번역을 수행 중입니다...")
+                content_en = ai_processor.translate_blog_post(markdown_content, "English")
+                content_ja = ai_processor.translate_blog_post(markdown_content, "Japanese")
+                
                 # 깃허브에 업로드
-                success, result = github_uploader.save_and_push(markdown_content)
+                success, result = github_uploader.save_and_push(markdown_content, translations={'en': content_en, 'ja': content_ja})
                 
                 if success:
                     await update.message.reply_text(f"✅ 뉴스 기반 블로그 자동 포스팅 성공!\n\n저장 경로: {result}")
