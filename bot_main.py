@@ -46,6 +46,26 @@ except Exception as e:
     logger.error(f"News Scraper init failed: {e}")
     news_scraper = None
 
+import json
+
+SENT_NEWS_FILE = "sent_news.json"
+
+def load_sent_news():
+    if os.path.exists(SENT_NEWS_FILE):
+        try:
+            with open(SENT_NEWS_FILE, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
+    return set()
+
+def save_sent_news(sent_urls):
+    try:
+        with open(SENT_NEWS_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(sent_urls)[-1000:], f) # 최신 1000개만 유지
+    except Exception:
+        pass
+
 async def send_news_task(bot_app):
     """뉴스를 스크래핑하고 텔레그램으로 전송합니다."""
     if not CHAT_ID or not news_scraper:
@@ -59,11 +79,14 @@ async def send_news_task(bot_app):
         
         all_news = game_news + trending_news
         
-        if not all_news:
-            logger.info("오늘 전송할 뉴스가 없습니다.")
+        sent_urls = load_sent_news()
+        new_news = [n for n in all_news if n['url'] not in sent_urls]
+        
+        if not new_news:
+            logger.info("오늘 전송할 새로운 뉴스가 없습니다. (모두 이미 전송됨)")
             return
 
-        for news in all_news:
+        for news in new_news:
             msg_text = f"📰 **새로운 뉴스 알림**\n\n"
             msg_text += f"**제목:** {news['title']}\n"
             if news.get('trend_keyword'):
@@ -77,8 +100,11 @@ async def send_news_task(bot_app):
                 pending_messages[sent_msg.message_id] = {
                     'news_data': news
                 }
+                sent_urls.add(news['url'])
             except Exception as e:
                 logger.error(f"Error sending telegram message: {e}")
+                
+        save_sent_news(sent_urls)
                 
     except Exception as e:
         logger.error(f"Error fetching news: {e}")
