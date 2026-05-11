@@ -5,6 +5,8 @@ import asyncio
 import schedule
 import time
 import threading
+import re
+from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -228,6 +230,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ AI와 통신 중 오류가 발생했습니다.")
 
 
+async def write_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """사용자가 입력한 마크다운을 그대로 블로그 포스트로 올립니다."""
+    if not github_uploader:
+        await update.message.reply_text("❌ Github Uploader가 설정되지 않았습니다.")
+        return
+        
+    # 명령어(/write) 부분을 제외한 나머지 텍스트 추출
+    user_text = update.message.text.replace("/write", "", 1).strip()
+    
+    if not user_text:
+        await update.message.reply_text("❌ 작성할 내용(프론트매터 포함 마크다운)을 함께 적어주세요!\n예: `/write ---\ntitle: 제목\n...`")
+        return
+        
+    await update.message.reply_text("📝 수동 포스트 업로드를 진행 중입니다...")
+    
+    # 정규식으로 title 추출 (예: title: "제목" 또는 title: 제목)
+    title_match = re.search(r'title:\s*"?([^"\n]+)"?', user_text)
+    if title_match:
+        title = title_match.group(1).strip()
+    else:
+        title = f"직접 작성한 글 ({datetime.now().strftime('%Y-%m-%d %H%M%S')})"
+        
+    try:
+        # 번역본 없이 바로 한국어 원본만 업로드 (translations 생략)
+        success, result = github_uploader.save_and_push(user_text, title=title)
+        
+        if success:
+            await update.message.reply_text(f"✅ 블로그 수동 포스팅 성공!\n\n저장 경로: {result}\n\n*※ 자동 번역이 생략되었습니다. 나중에 `/sync` 명령어를 통해 일괄 번역하실 수 있습니다.*")
+        else:
+            await update.message.reply_text(f"❌ 깃허브 업로드 실패:\n{result}")
+    except Exception as e:
+        logger.error(f"Error during manual posting: {e}")
+        await update.message.reply_text(f"❌ 오류 발생: {str(e)}")
+
+
 async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """현재까지 사용한 API 토큰 및 예상 요금 출력"""
     if not ai_processor:
@@ -345,6 +382,7 @@ def main():
     application.add_handler(CommandHandler("reset", reset_command))
     application.add_handler(CommandHandler("new", reset_command))
     application.add_handler(CommandHandler("post", post_command))
+    application.add_handler(CommandHandler("write", write_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CommandHandler("sync", sync_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
