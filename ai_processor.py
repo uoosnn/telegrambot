@@ -48,7 +48,7 @@ class AIProcessor:
 
 [요구사항]
 1. VitePress 기반 블로그이므로 마크다운 최상단에 반드시 Frontmatter(yaml 형식)를 포함할 것.
-   - title: {title_instruction if title_instruction else '대화 요약'} (적절히 다듬어주세요)
+   - title: "{title_instruction if title_instruction else '대화 요약'}" (반드시 양끝에 큰따옴표를 붙일 것)
    - date: {kst_now.strftime('%Y-%m-%d')}
    - tags: [AI, 대화요약]
 2. 대화 내용을 보기 좋게 정리하고, 필요하다면 서론-본론-결론 구조를 갖출 것.
@@ -81,7 +81,7 @@ class AIProcessor:
 
 [요구사항]
 1. VitePress 기반 블로그이므로 마크다운 최상단에 반드시 Frontmatter(yaml 형식)를 포함할 것.
-   - title: 매력적인 제목 (뉴스 제목과 코멘트 조합)
+   - title: "매력적인 제목" (반드시 양끝에 큰따옴표를 붙일 것)
    - date: {kst_now.strftime('%Y-%m-%d')}
    - tags: [뉴스, {news_data.get('category', 'trend')}]
 2. '뉴스 요약' -> '나의 생각(코멘트 바탕)' -> '결론 및 원문 링크' 구조로 작성할 것.
@@ -93,3 +93,29 @@ class AIProcessor:
 """
         response = self.model.generate_content(prompt)
         return response.text.strip()
+
+    def translate_blog_post(self, markdown_text, target_language):
+        """기존 마크다운 포스트를 지정된 언어로 번역합니다. (프론트매터 및 마크다운 구조 유지)"""
+        prompt = f"""
+당신은 완벽한 IT/블로그 전문 번역가입니다.
+아래 제공된 [원본 마크다운] 문서를 **{target_language}**로 번역해 주세요.
+
+[요구사항]
+1. 최상단의 Frontmatter(yaml 형식) 블록은 그대로 유지하되, `title`의 값은 해당 언어로 번역하고 **반드시 큰따옴표("")**로 묶어주세요. (`date`와 `tags`는 원본과 동일하게 유지)
+2. 마크다운의 구조(코드 블록, 인용구, 링크, 볼드체 등)는 절대 훼손하지 마세요.
+3. 글의 내용과 맥락을 가장 자연스럽고 매끄러운 {target_language}로 번역하세요.
+4. 오직 번역된 마크다운 결과물만 출력하세요. (설명이나 인사말 금지)
+
+[원본 마크다운]
+{markdown_text}
+"""
+        response = self.model.generate_content(prompt)
+        # 번역본에서도 백틱 래퍼가 있다면 제거
+        translated = response.text.strip()
+        if translated.startswith("```markdown"):
+            translated = translated[11:]
+        if translated.startswith("```"):
+            translated = translated[3:]
+        if translated.endswith("```"):
+            translated = translated[:-3]
+        return translated.strip()
