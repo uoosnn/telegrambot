@@ -13,7 +13,7 @@ class AIProcessor:
         
         # 할루시네이션(환각)을 줄이기 위해 temperature 낮춤
         generation_config = genai.types.GenerationConfig(
-            temperature=0.2,
+            temperature=0.4,
             top_p=0.8,
             top_k=40
         )
