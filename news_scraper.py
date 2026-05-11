@@ -1,0 +1,74 @@
+import feedparser
+import re
+from collections import Counter
+from datetime import datetime, timedelta
+
+class NewsScraper:
+    def __init__(self):
+        self.game_rss_url = "https://news.google.com/rss/search?q=%EA%B2%8C%EC%9E%84&hl=ko&gl=KR&ceid=KR:ko"
+        self.headline_rss_url = "https://news.google.com/rss?hl=ko&gl=KR&ceid=KR:ko"
+
+    def fetch_game_news(self, limit=2):
+        """'게임' 키워드로 검색된 최신 뉴스 가져오기"""
+        feed = feedparser.parse(self.game_rss_url)
+        news_list = []
+        for entry in feed.entries[:limit]:
+            news_list.append({
+                "title": entry.title,
+                "url": entry.link,
+                "content": entry.get("description", ""),
+                "category": "game_news"
+            })
+        return news_list
+
+    def fetch_trending_news(self, threshold=3):
+        """
+        주요 뉴스에서 많이 겹치는 키워드(N개 이상)가 있는 기사를 추출.
+        간단한 형태소(명사류) 추출을 통해 클러스터링을 시도합니다.
+        """
+        feed = feedparser.parse(self.headline_rss_url)
+        
+        # 제목에서 2글자 이상의 단어만 추출
+        word_counts = Counter()
+        entries_by_word = {}
+        
+        for entry in feed.entries:
+            title = entry.title
+            # 특수기호 제거 및 단어 분리
+            clean_title = re.sub(r'[^\w\s]', '', title)
+            words = clean_title.split()
+            
+            seen_words = set()
+            for word in words:
+                if len(word) >= 2: # 2글자 이상 단어만 취급
+                    seen_words.add(word)
+            
+            for word in seen_words:
+                word_counts[word] += 1
+                if word not in entries_by_word:
+                    entries_by_word[word] = []
+                entries_by_word[word].append(entry)
+                
+        # threshold(예: 3번) 이상 등장한 단어 중 가장 많이 등장한 키워드를 트렌드로 선정
+        trending_news_list = []
+        added_links = set()
+        
+        for word, count in word_counts.most_common():
+            if count >= threshold:
+                # 해당 트렌드 키워드의 대표 기사(첫 번째 기사) 1개만 추출
+                representative_entry = entries_by_word[word][0]
+                if representative_entry.link not in added_links:
+                    trending_news_list.append({
+                        "title": representative_entry.title,
+                        "url": representative_entry.link,
+                        "content": representative_entry.get("description", ""),
+                        "category": "trending_news",
+                        "trend_keyword": word
+                    })
+                    added_links.add(representative_entry.link)
+                
+                # 트렌드 뉴스는 하루에 너무 많이 보내지 않도록 최대 2개까지만 제한
+                if len(trending_news_list) >= 2:
+                    break
+                    
+        return trending_news_list

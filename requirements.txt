@@ -1,0 +1,8 @@
+python-telegram-bot
+google-generativeai
+gitpython
+python-dotenv
+schedule
+feedparser
+beautifulsoup4
+watchdog
