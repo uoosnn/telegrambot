@@ -89,6 +89,34 @@ class AIProcessor:
                 return "❌ API 지출 한도를 초과했습니다 (Quota Exceeded)."
             return f"❌ 오류가 발생했습니다: {str(e)}"
 
+    def generate_title_from_history(self):
+        """현재까지의 대화 내용을 분석하여 블로그 포스트에 적합한 제목을 자동 생성합니다."""
+        if not self.chat_session or not self.chat_session.history:
+            return "대화 기록"
+
+        history_text = ""
+        for message in self.chat_session.history:
+            role = "사용자" if message.role == "user" else "AI"
+            text = message.parts[0].text if message.parts else ""
+            history_text += f"[{role}]: {text}\n\n"
+
+        prompt = f"""
+아래 대화 내용을 분석하여, 이 대화를 블로그 포스트로 작성할 때 적합한 **제목**을 하나만 생성해 주세요.
+
+[규칙]
+1. 제목은 10자~30자 이내로 간결하고 핵심을 담아야 합니다.
+2. 오직 제목 텍스트만 출력하세요. (따옴표, 설명, 번호 등 일체 금지)
+3. 대화의 주요 주제나 핵심 키워드를 반영하세요.
+
+[대화 내용]
+{history_text}
+"""
+        response = self._generate_content_with_tracking(prompt)
+        title = response.text.strip()
+        # 혹시 따옴표가 붙어 있다면 제거
+        title = title.strip('"').strip("'").strip()
+        return title if title else "대화 기록"
+
     def generate_blog_post_from_history(self, title_instruction):
         """현재까지의 대화 내용을 바탕으로 블로그 포스트를 생성합니다."""
         if not self.chat_session or not self.chat_session.history:
