@@ -1,12 +1,15 @@
 import os
 import glob
+import json
 import logging
 import asyncio
 import schedule
+import subprocess
 import time
 import threading
 import re
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
@@ -54,7 +57,7 @@ except Exception as e:
     logger.error(f"News Scraper init failed: {e}")
     news_scraper = None
 
-import json
+
 
 SENT_NEWS_FILE = "sent_news.json"
 
@@ -483,7 +486,7 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     # Commit and Push
     try:
-        import subprocess
+
         subprocess.run(["git", "add", "."], cwd="/source/uoosnn.github.io", check=True)
         # 변경사항이 없을 수도 있으므로 (git commit은 에러가 날 수 있음)
         result = subprocess.run(["git", "status", "--porcelain"], cwd="/source/uoosnn.github.io", capture_output=True, text=True)
