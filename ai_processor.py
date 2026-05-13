@@ -69,9 +69,12 @@ class AIProcessor:
         except Exception:
             return {"input_tokens": 0, "output_tokens": 0}
 
-    def _generate_content_with_tracking(self, prompt):
+    def _generate_content_with_tracking(self, prompt, model=None):
+        """지정된 모델로 콘텐츠를 생성하고 사용량을 추적합니다. 기본값은 post_model."""
+        if model is None:
+            model = self.post_model
         try:
-            response = self.model.generate_content(prompt)
+            response = model.generate_content(prompt)
             self._record_usage(response)
             return response
         except ResourceExhausted:
@@ -83,7 +86,7 @@ class AIProcessor:
 
     def start_new_session(self):
         """새로운 대화 세션을 시작합니다 (기존 문맥 초기화)."""
-        self.chat_session = self.model.start_chat(history=[])
+        self.chat_session = self.chat_model.start_chat(history=[])
         return "새로운 대화가 시작되었습니다. 무엇을 도와드릴까요?"
 
     def send_message(self, message):
