@@ -11,17 +11,30 @@ class AIProcessor:
             raise ValueError("GEMINI_API_KEY is not set in environment variables.")
         genai.configure(api_key=api_key)
         
-        # 할루시네이션(환각)을 줄이기 위해 temperature 낮춤
-        generation_config = genai.types.GenerationConfig(
-            temperature=0.4,
-            top_p=0.8,
+        # 일반 대화용 모델: 자연스러운 대화를 위해 temperature 높임
+        chat_config = genai.types.GenerationConfig(
+            temperature=0.7,
+            top_p=0.9,
             top_k=40
         )
-        self.model = genai.GenerativeModel(
+        self.chat_model = genai.GenerativeModel(
             'gemini-2.5-pro',
-            generation_config=generation_config,
-            system_instruction="당신은 사실 기반으로만 말하는 정확한 어시스턴트입니다. 사용자에게 제공받은 정보 외에 임의의 사실을 절대 지어내지 마세요."
+            generation_config=chat_config,
+            system_instruction="당신은 친절하고 유능한 어시스턴트입니다. 자연스럽고 재미있게 대화하되, 사실에 기반하여 답변하세요."
         )
+        
+        # 블로그 포스트 작성용 모델: 할루시네이션(환각)을 최소화하기 위해 temperature 낮춤
+        post_config = genai.types.GenerationConfig(
+            temperature=0.2,
+            top_p=0.7,
+            top_k=30
+        )
+        self.post_model = genai.GenerativeModel(
+            'gemini-2.5-pro',
+            generation_config=post_config,
+            system_instruction="당신은 사실 기반으로만 글을 작성하는 정확한 블로그 에디터입니다. 제공받은 정보 외에 임의의 사실을 절대 지어내지 마세요. 추측이나 불확실한 내용은 포함하지 마세요."
+        )
+        
         self.chat_session = None
         self.usage_file = os.path.join(os.path.dirname(__file__), "api_usage.json")
         self._init_usage_stats()
