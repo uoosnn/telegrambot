@@ -31,7 +31,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # 봇 시작 시간 기록
-BOT_START_TIME = datetime.utcnow() + timedelta(hours=9)  # KST
+BOT_START_TIME = datetime.now(ZoneInfo("Asia/Seoul"))
 
 # 봇이 보낸 뉴스 메시지 보관소 (Reply 시 사용)
 pending_messages = {}
@@ -369,7 +369,7 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def uptime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """봇이 켜져있던 시간을 출력합니다."""
-    kst_now = datetime.utcnow() + timedelta(hours=9)
+    kst_now = datetime.now(ZoneInfo("Asia/Seoul"))
     uptime_delta = kst_now - BOT_START_TIME
     
     total_seconds = int(uptime_delta.total_seconds())
