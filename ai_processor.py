@@ -95,27 +95,26 @@ class AIProcessor:
         if not self.chat_session:
             self.start_new_session()
         
-        try:
-            response = self.chat_session.send_message(message)
-            self._record_usage(response)
-            return response.text.strip()
-        except ResourceExhausted:
-            return "❌ API 지출 한도를 초과했습니다 (Quota Exceeded)."
-        except Exception as e:
-            if "429" in str(e) or "quota" in str(e).lower():
-                return "❌ API 지출 한도를 초과했습니다 (Quota Exceeded)."
-            return f"❌ 오류가 발생했습니다: {str(e)}"
+        response = self.chat_session.send_message(message)
+        self._record_usage(response)
+        return response.text.strip()
 
-    def generate_title_from_history(self):
-        """현재까지의 대화 내용을 분석하여 블로그 포스트에 적합한 제목을 자동 생성합니다."""
+    def _get_history_text(self):
+        """현재 대화 세션의 히스토리를 텍스트로 변환합니다."""
         if not self.chat_session or not self.chat_session.history:
-            return "대화 기록"
-
-        history_text = ""
+            return ""
+        lines = []
         for message in self.chat_session.history:
             role = "사용자" if message.role == "user" else "AI"
             text = message.parts[0].text if message.parts else ""
-            history_text += f"[{role}]: {text}\n\n"
+            lines.append(f"[{role}]: {text}")
+        return "\n\n".join(lines)
+
+    def generate_title_from_history(self):
+        """현재까지의 대화 내용을 분석하여 블로그 포스트에 적합한 제목을 자동 생성합니다."""
+        history_text = self._get_history_text()
+        if not history_text:
+            return "대화 기록"
 
         prompt = f"""
 아래 대화 내용을 분석하여, 이 대화를 블로그 포스트로 작성할 때 적합한 **제목**을 하나만 생성해 주세요.
@@ -136,15 +135,9 @@ class AIProcessor:
 
     def generate_blog_post_from_history(self, title_instruction):
         """현재까지의 대화 내용을 바탕으로 블로그 포스트를 생성합니다."""
-        if not self.chat_session or not self.chat_session.history:
+        history_text = self._get_history_text()
+        if not history_text:
             return "대화 기록이 없습니다. 먼저 대화를 나누어 주세요."
-
-        # 대화 기록 텍스트화
-        history_text = ""
-        for message in self.chat_session.history:
-            role = "사용자" if message.role == "user" else "AI"
-            text = message.parts[0].text if message.parts else ""
-            history_text += f"[{role}]: {text}\n\n"
 
         kst_now = datetime.now(ZoneInfo("Asia/Seoul"))
 
@@ -216,12 +209,4 @@ class AIProcessor:
 {markdown_text}
 """
         response = self._generate_content_with_tracking(prompt)
-        # 번역본에서도 백틱 래퍼가 있다면 제거
-        translated = response.text.strip()
-        if translated.startswith("```markdown"):
-            translated = translated[11:]
-        if translated.startswith("```"):
-            translated = translated[3:]
-        if translated.endswith("```"):
-            translated = translated[:-3]
-        return translated.strip()
+        return response.text.strip()
