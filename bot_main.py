@@ -38,6 +38,17 @@ pending_messages = {}
 # 게시 확인 대기 중인 콘텐츠 보관소
 pending_confirmations = {}
 
+def cleanup_expired_pending(max_age_seconds=86400):
+    """24시간 이상 된 pending 항목을 자동 삭제합니다."""
+    now = time.time()
+    expired = [k for k, v in pending_messages.items()
+               if now - v.get('timestamp', 0) > max_age_seconds]
+    for k in expired:
+        pending_messages.pop(k, None)
+        pending_confirmations.pop(k, None)
+    if expired:
+        logger.info(f"만료된 pending 항목 {len(expired)}건을 정리했습니다.")
+
 # Initialize Modules
 try:
     ai_processor = AIProcessor()
@@ -81,6 +92,9 @@ async def send_news_task(bot_app):
     """뉴스를 스크래핑하고 텔레그램으로 전송합니다."""
     if not CHAT_ID or not news_scraper:
         return
+    
+    # 24시간 이상 된 pending 항목 정리
+    cleanup_expired_pending()
         
     try:
         # 1. 게임 뉴스 가져오기
@@ -109,7 +123,8 @@ async def send_news_task(bot_app):
                 sent_msg = await bot_app.bot.send_message(chat_id=CHAT_ID, text=msg_text, parse_mode='Markdown')
                 # 봇이 보낸 메시지 ID를 키로 하여 원본 포스트 데이터를 저장
                 pending_messages[sent_msg.message_id] = {
-                    'news_data': news
+                    'news_data': news,
+                    'timestamp': time.time()
                 }
                 sent_urls.add(news['url'])
             except Exception as e:
@@ -462,6 +477,8 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     await update.message.reply_text(f"📝 총 {len(needs_sync)}개의 문서가 발견되었습니다. 번역 및 동기화를 진행합니다. 잠시만 기다려주세요...")
     
+    failed = []
+    synced_count = 0
     for file_path, filename in needs_sync:
         try:
             with open(file_path, "r", encoding="utf-8") as f:
@@ -478,11 +495,20 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
             with open(ja_path, "w", encoding="utf-8") as f:
                 f.write(content_ja)
+            
+            synced_count += 1
                 
         except Exception as e:
             logger.error(f"Error syncing {filename}: {e}")
-            await update.message.reply_text(f"❌ {filename} 동기화 중 오류 발생: {e}")
-            return
+            failed.append(filename)
+            continue
+    
+    if failed:
+        await update.message.reply_text(f"⚠️ {len(failed)}건 실패: {', '.join(failed)}")
+    
+    if synced_count == 0:
+        await update.message.reply_text("❌ 번역에 성공한 파일이 없습니다.")
+        return
             
     # Commit and Push
     try:
