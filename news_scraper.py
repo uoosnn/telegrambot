@@ -3,6 +3,20 @@ import re
 from collections import Counter
 from datetime import datetime, timedelta
 
+# 한국어 트렌딩 키워드 추출 시 무시할 불용어 리스트
+KOREAN_STOPWORDS = {
+    # 조사/어미
+    "에서", "으로", "에게", "까지", "부터", "에는", "에도", "와의",
+    "이번", "대한", "위해", "통해", "관련", "이후", "이전", "대해",
+    # 일반적인 뉴스 상투어
+    "것으로", "것이", "수도", "있는", "없는", "하는", "되는", "된다",
+    "발표", "진행", "예정", "올해", "내년", "오늘", "최근", "현재",
+    "해당", "사실", "가능", "결과", "상황", "문제", "의견",
+    # 기타 고빈도 비핵심 단어
+    "기자", "뉴스", "속보", "종합", "단독", "포토", "영상",
+    "한국", "국내", "세계", "서울", "정부", "사회", "경제",
+}
+
 class NewsScraper:
     def __init__(self):
         self.game_rss_url = "https://news.google.com/rss/search?q=%EA%B2%8C%EC%9E%84&hl=ko&gl=KR&ceid=KR:ko"
@@ -40,7 +54,7 @@ class NewsScraper:
             
             seen_words = set()
             for word in words:
-                if len(word) >= 2: # 2글자 이상 단어만 취급
+                if len(word) >= 2 and word not in KOREAN_STOPWORDS:
                     seen_words.add(word)
             
             for word in seen_words:
