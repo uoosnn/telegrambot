@@ -2,7 +2,8 @@ import os
 import json
 import google.generativeai as genai
 from google.api_core.exceptions import ResourceExhausted
-from datetime import datetime, timedelta
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 class AIProcessor:
     def __init__(self):
@@ -145,7 +146,7 @@ class AIProcessor:
             text = message.parts[0].text if message.parts else ""
             history_text += f"[{role}]: {text}\n\n"
 
-        kst_now = datetime.utcnow() + timedelta(hours=9)
+        kst_now = datetime.now(ZoneInfo("Asia/Seoul"))
 
         prompt = f"""
 당신은 나와 대화했던 내용을 바탕으로 훌륭한 기술/일상 블로그 포스트를 작성하는 에디터입니다.
@@ -171,7 +172,7 @@ class AIProcessor:
 
     def generate_blog_from_news(self, news_data, user_comment):
         """뉴스 원본 데이터와 사용자의 코멘트를 바탕으로 블로그 포스트 생성"""
-        kst_now = datetime.utcnow() + timedelta(hours=9)
+        kst_now = datetime.now(ZoneInfo("Asia/Seoul"))
         prompt = f"""
 당신은 기술 및 게임 트렌드 블로그 전문 에디터입니다.
 아래의 [뉴스 원본]과 [나의 코멘트]를 분석하여 훌륭한 마크다운(Markdown) 포스트를 작성해 주세요.
