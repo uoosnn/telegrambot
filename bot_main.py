@@ -38,17 +38,6 @@ pending_messages = {}
 # 게시 확인 대기 중인 콘텐츠 보관소
 pending_confirmations = {}
 
-def cleanup_expired_pending(max_age_seconds=86400):
-    """24시간 이상 된 pending 항목을 자동 삭제합니다."""
-    now = time.time()
-    expired = [k for k, v in pending_messages.items()
-               if now - v.get('timestamp', 0) > max_age_seconds]
-    for k in expired:
-        pending_messages.pop(k, None)
-        pending_confirmations.pop(k, None)
-    if expired:
-        logger.info(f"만료된 pending 항목 {len(expired)}건을 정리했습니다.")
-
 # Initialize Modules
 try:
     ai_processor = AIProcessor()
@@ -92,9 +81,6 @@ async def send_news_task(bot_app):
     """뉴스를 스크래핑하고 텔레그램으로 전송합니다."""
     if not CHAT_ID or not news_scraper:
         return
-    
-    # 24시간 이상 된 pending 항목 정리
-    cleanup_expired_pending()
         
     try:
         # 1. 게임 뉴스 가져오기
@@ -123,8 +109,7 @@ async def send_news_task(bot_app):
                 sent_msg = await bot_app.bot.send_message(chat_id=CHAT_ID, text=msg_text, parse_mode='Markdown')
                 # 봇이 보낸 메시지 ID를 키로 하여 원본 포스트 데이터를 저장
                 pending_messages[sent_msg.message_id] = {
-                    'news_data': news,
-                    'timestamp': time.time()
+                    'news_data': news
                 }
                 sent_urls.add(news['url'])
             except Exception as e:
@@ -176,7 +161,15 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """현재까지의 대화를 기반으로 깃허브에 포스팅"""
+    """현재까지의 대화를 기반으로 'blog' 폴더에 포스팅"""
+    await _perform_post(update, context, folder_name="blog")
+
+async def techpost_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """현재까지의 대화를 기반으로 'tech' 폴더에 포스팅"""
+    await _perform_post(update, context, folder_name="tech")
+
+async def _perform_post(update: Update, context: ContextTypes.DEFAULT_TYPE, folder_name="blog"):
+    """공통 포스팅 로직"""
     if not ai_processor or not github_uploader:
         await update.message.reply_text("❌ AI Processor 또는 Github Uploader가 설정되지 않았습니다.")
         return
@@ -191,19 +184,29 @@ async def post_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Error generating title: {e}")
             title_instruction = f"대화 기록 ({datetime.now().strftime('%Y-%m-%d')})"
     
-    await update.message.reply_text(f"⏳ 대화를 정리하여 포스팅 중입니다... (주제: {title_instruction})")
+    target_name = "기술 블로그(tech)" if folder_name == "tech" else "블로그(blog)"
+    await update.message.reply_text(f"⏳ 대화를 정리하여 {target_name}에 포스팅 중입니다... (주제: {title_instruction})")
     
     try:
         markdown_content = ai_processor.generate_blog_post_from_history(title_instruction)
         
+        # tech 포스트인 경우 태그 자동 수정
+        if folder_name == "tech":
+            markdown_content = markdown_content.replace("tags: [AI, 대화요약]", "tags: [Tech, AI, 기술분석]")
+
         await update.message.reply_text("🌐 영문 및 일문으로 자동 번역을 수행 중입니다...")
         content_en = ai_processor.translate_blog_post(markdown_content, "English")
         content_ja = ai_processor.translate_blog_post(markdown_content, "Japanese")
         
-        success, result = github_uploader.save_and_push(markdown_content, title=title_instruction, translations={'en': content_en, 'ja': content_ja})
+        success, result = github_uploader.save_and_push(
+            markdown_content, 
+            title=title_instruction, 
+            folder_name=folder_name,
+            translations={'en': content_en, 'ja': content_ja}
+        )
         
         if success:
-            await update.message.reply_text(f"✅ 블로그 포스팅 성공!\n\n저장 경로: {result}")
+            await update.message.reply_text(f"✅ {target_name} 포스팅 성공!\n\n저장 경로: {result}")
         else:
             await update.message.reply_text(f"❌ 깃허브 업로드 실패:\n{result}")
     except Exception as e:
@@ -371,7 +374,8 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start - 봇 시작 및 초기화\n"
         "/reset - 대화 내용 초기화 (새 대화 시작)\n"
         "/new - /reset과 동일\n"
-        "/post [제목] - 대화 내용을 블로그에 포스팅 (제목 생략 시 AI가 자동 생성)\n"
+        "/post [제목] - 대화 내용을 블로그(blog)에 포스팅\n"
+        "/techpost [제목] - 대화 내용을 기술 블로그(tech)에 포스팅\n"
         "/write - 마크다운을 직접 입력하여 포스팅\n"
         "/sync - 블로그 폴더 스캔 후 미번역 포스트 일괄 번역\n"
         "/usage - API 사용량 및 예상 요금 확인\n"
@@ -437,70 +441,89 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """로컬 블로그 폴더를 스캔하여 번역이 안 된 글을 번역하고 푸시합니다."""
-    await update.message.reply_text("🔄 블로그 폴더 스캔을 시작합니다...")
+    """로컬 블로그 및 기술 블로그 폴더를 스캔하여 번역이 안 된 글을 번역하고 푸시합니다."""
+    await update.message.reply_text("🔄 블로그 및 기술 문서 스캔을 시작합니다...")
     
     if not ai_processor or not github_uploader:
         await update.message.reply_text("❌ AI Processor 또는 Github Uploader가 설정되지 않았습니다.")
         return
         
-    blog_dir = "/source/uoosnn.github.io/blog"
-    en_dir = "/source/uoosnn.github.io/en/blog"
-    ja_dir = "/source/uoosnn.github.io/ja/blog"
+    # 스캔할 대상 디렉토리 설정
+    sync_targets = [
+        {
+            "src": "/source/uoosnn.github.io/blog",
+            "en": "/source/uoosnn.github.io/en/blog",
+            "ja": "/source/uoosnn.github.io/ja/blog"
+        },
+        {
+            "src": "/source/uoosnn.github.io/tech",
+            "en": "/source/uoosnn.github.io/en/tech",
+            "ja": "/source/uoosnn.github.io/ja/tech"
+        }
+    ]
     
-    os.makedirs(en_dir, exist_ok=True)
-    os.makedirs(ja_dir, exist_ok=True)
+    total_needs_sync = []
     
-    md_files = glob.glob(os.path.join(blog_dir, "*.md"))
-    needs_sync = []
-    
-    for file_path in md_files:
-        filename = os.path.basename(file_path)
-        if filename == "index.md":
-            continue
-            
-        kr_mtime = os.path.getmtime(file_path)
+    for target in sync_targets:
+        src_dir = target["src"]
+        en_dir = target["en"]
+        ja_dir = target["ja"]
         
-        en_path = os.path.join(en_dir, filename)
-        ja_path = os.path.join(ja_dir, filename)
+        os.makedirs(en_dir, exist_ok=True)
+        os.makedirs(ja_dir, exist_ok=True)
         
-        # 번역본이 없거나 한국어 원본보다 오래된 경우 (여유 2초)
-        is_en_outdated = not os.path.exists(en_path) or (kr_mtime > os.path.getmtime(en_path) + 2)
-        is_ja_outdated = not os.path.exists(ja_path) or (kr_mtime > os.path.getmtime(ja_path) + 2)
-        
-        if is_en_outdated or is_ja_outdated:
-            needs_sync.append((file_path, filename))
-            
-    if not needs_sync:
-        await update.message.reply_text("✅ 모든 포스트가 이미 동기화(번역)되어 있습니다.")
-        return
-        
-    await update.message.reply_text(f"📝 총 {len(needs_sync)}개의 문서가 발견되었습니다. 번역 및 동기화를 진행합니다. 잠시만 기다려주세요...")
-    
-    failed = []
-    synced_count = 0
-    for file_path, filename in needs_sync:
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            
-            content_en = ai_processor.translate_blog_post(content, "English")
-            content_ja = ai_processor.translate_blog_post(content, "Japanese")
-            
+        md_files = glob.glob(os.path.join(src_dir, "*.md"))
+        for file_path in md_files:
+            filename = os.path.basename(file_path)
+            if filename == "index.md":
+                continue
+                
+            kr_mtime = os.path.getmtime(file_path)
             en_path = os.path.join(en_dir, filename)
             ja_path = os.path.join(ja_dir, filename)
             
-            with open(en_path, "w", encoding="utf-8") as f:
-                f.write(content_en)
-                
-            with open(ja_path, "w", encoding="utf-8") as f:
-                f.write(content_ja)
+            is_en_outdated = not os.path.exists(en_path) or (kr_mtime > os.path.getmtime(en_path) + 2)
+            is_ja_outdated = not os.path.exists(ja_path) or (kr_mtime > os.path.getmtime(ja_path) + 2)
+            
+            if is_en_outdated or is_ja_outdated:
+                total_needs_sync.append({
+                    "file_path": file_path,
+                    "filename": filename,
+                    "en_path": en_path,
+                    "ja_path": ja_path,
+                    "is_en_outdated": is_en_outdated,
+                    "is_ja_outdated": is_ja_outdated
+                })
+            
+    if not total_needs_sync:
+        await update.message.reply_text("✅ 모든 포스트가 이미 동기화(번역)되어 있습니다.")
+        return
+        
+    await update.message.reply_text(f"📝 총 {len(total_needs_sync)}개의 문서가 발견되었습니다. 번역 및 동기화를 진행합니다. 잠시만 기다려주세요...")
+    
+    failed = []
+    synced_count = 0
+    for item in total_needs_sync:
+        try:
+            with open(item["file_path"], "r", encoding="utf-8") as f:
+                content = f.read()
+            
+            # 필요한 경우에만 번역 수행
+            if item["is_en_outdated"]:
+                content_en = ai_processor.translate_blog_post(content, "English")
+                with open(item["en_path"], "w", encoding="utf-8") as f:
+                    f.write(content_en)
+            
+            if item["is_ja_outdated"]:
+                content_ja = ai_processor.translate_blog_post(content, "Japanese")
+                with open(item["ja_path"], "w", encoding="utf-8") as f:
+                    f.write(content_ja)
             
             synced_count += 1
                 
         except Exception as e:
-            logger.error(f"Error syncing {filename}: {e}")
-            failed.append(filename)
+            logger.error(f"Error syncing {item['filename']}: {e}")
+            failed.append(item['filename'])
             continue
     
     if failed:
@@ -512,14 +535,13 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     # Commit and Push
     try:
-
         subprocess.run(["git", "add", "."], cwd="/source/uoosnn.github.io", check=True)
         # 변경사항이 없을 수도 있으므로 (git commit은 에러가 날 수 있음)
         result = subprocess.run(["git", "status", "--porcelain"], cwd="/source/uoosnn.github.io", capture_output=True, text=True)
         if result.stdout.strip():
             subprocess.run(["git", "commit", "-m", "docs: Auto translate manual post via /sync"], cwd="/source/uoosnn.github.io", check=True)
             subprocess.run(["git", "push"], cwd="/source/uoosnn.github.io", check=True)
-            await update.message.reply_text(f"✅ 총 {len(needs_sync)}개의 문서 다국어 번역 및 배포가 완료되었습니다!")
+            await update.message.reply_text(f"✅ 총 {synced_count}개의 문서 다국어 번역 및 배포가 완료되었습니다!")
         else:
             await update.message.reply_text("✅ 깃허브에 반영할 새로운 변경사항이 없습니다.")
     except Exception as e:
@@ -539,6 +561,7 @@ def main():
     application.add_handler(CommandHandler("reset", reset_command))
     application.add_handler(CommandHandler("new", reset_command))
     application.add_handler(CommandHandler("post", post_command))
+    application.add_handler(CommandHandler("techpost", techpost_command))
     application.add_handler(CommandHandler("write", write_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CommandHandler("sync", sync_command))
