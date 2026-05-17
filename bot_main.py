@@ -482,6 +482,7 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             en_path = os.path.join(en_dir, filename)
             ja_path = os.path.join(ja_dir, filename)
             
+        # 번역본이 없거나 한국어 원본보다 오래된 경우 (여유 2초)
             is_en_outdated = not os.path.exists(en_path) or (kr_mtime > os.path.getmtime(en_path) + 2)
             is_ja_outdated = not os.path.exists(ja_path) or (kr_mtime > os.path.getmtime(ja_path) + 2)
             
