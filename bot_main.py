@@ -8,6 +8,7 @@ import subprocess
 import time
 import threading
 import re
+import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -281,6 +282,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error communicating with AI: {e}")
         await update.message.reply_text("❌ AI와 통신 중 오류가 발생했습니다.")
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """이미지 수신 시 깃허브에 업로드하고 마크다운 링크 반환 및 AI 컨텍스트에 주입"""
+    if not github_uploader or not ai_processor:
+        await update.message.reply_text("❌ Github Uploader 또는 AI Processor가 설정되지 않았습니다.")
+        return
+
+    await update.message.reply_text("⏳ 이미지를 깃허브에 업로드 중입니다...")
+    try:
+        # 텔레그램에서 가장 해상도가 높은 마지막 사진 가져오기
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        file_bytes = await file.download_as_bytearray()
+        
+        # 고유 파일명 생성
+        filename = f"img_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.jpg"
+        
+        success, result = github_uploader.save_image_and_push(file_bytes, filename)
+        if success:
+            # 사용자의 캡션이 있는지 확인
+            caption = update.message.caption or ""
+            context_msg = f"사용자가 이미지를 업로드했습니다. 마크다운 링크: {result}"
+            if caption:
+                context_msg += f"\n사진 설명(캡션): {caption}"
+                
+            # AI의 대화 기록에 시스템(또는 사용자) 메시지로 몰래 주입하기 위해 send_message 활용
+            ai_processor.send_message(context_msg)
+            
+            await update.message.reply_text(
+                f"✅ 이미지 업로드 완료!\n\nAI가 이 이미지를 인지했습니다. 바로 사용할 수 있는 마크다운 링크입니다:\n`{result}`",
+                parse_mode='Markdown'
+            )
+        else:
+            await update.message.reply_text(f"❌ 깃허브 업로드 실패:\n{result}")
+    except Exception as e:
+        logger.error(f"Error uploading photo: {e}")
+        await update.message.reply_text(f"❌ 오류 발생: {str(e)}")
 
 
 async def handle_confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -569,6 +608,7 @@ def main():
     application.add_handler(CommandHandler("info", info_command))
     application.add_handler(CommandHandler("uptime", uptime_command))
     application.add_handler(CallbackQueryHandler(handle_confirmation_callback))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # 스케줄러를 백그라운드 스레드에서 실행

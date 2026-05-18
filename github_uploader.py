@@ -71,3 +71,23 @@ class GithubUploader:
         except Exception as e:
             print(f"Git Push Error: {e}")
             return False, str(e)
+
+    def save_image_and_push(self, file_bytes, filename):
+        target_dir = os.path.join(self.repo_path, "public", "images")
+        os.makedirs(target_dir, exist_ok=True)
+        
+        filepath = os.path.join(target_dir, filename)
+        
+        with open(filepath, 'wb') as f:
+            f.write(file_bytes)
+            
+        try:
+            self.repo.git.add(filepath)
+            self.repo.index.commit(f"docs: Upload image {filename}")
+            origin = self.repo.remote(name='origin')
+            origin.push()
+            # 마크다운 링크 반환
+            return True, f"![이미지](/images/{filename})"
+        except Exception as e:
+            print(f"Git Push Error: {e}")
+            return False, str(e)
