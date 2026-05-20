@@ -36,6 +36,18 @@ class AIProcessor:
             system_instruction="당신은 사실 기반으로만 글을 작성하는 정확한 블로그 에디터입니다. 제공받은 정보 외에 임의의 사실을 절대 지어내지 마세요. 추측이나 불확실한 내용은 포함하지 마세요."
         )
         
+        # 단순 번역용 가성비 모델: 저렴하고 빠른 gemini-2.5-flash 사용
+        trans_config = genai.types.GenerationConfig(
+            temperature=0.3, # 번역은 창의성보다 정확성이 중요하므로 온도를 낮춤
+            top_p=0.8,
+            top_k=40
+        )
+        self.trans_model = genai.GenerativeModel(
+            'gemini-2.5-flash',
+            generation_config=trans_config,
+            system_instruction="당신은 원본의 형식과 마크다운 문법을 완벽히 보존하는 전문 번역가입니다."
+        )
+        
         self.chat_session = None
         self.usage_file = os.path.join(os.path.dirname(__file__), "api_usage.json")
         self._init_usage_stats()
@@ -229,5 +241,6 @@ tags: [Tech, Troubleshooting, Incident Report]
 [원본 마크다운]
 {markdown_text}
 """
-        response = self._generate_content_with_tracking(prompt)
+        # 번역에는 훨씬 저렴하고 빠른 trans_model (gemini-2.5-flash) 사용
+        response = self._generate_content_with_tracking(prompt, model=self.trans_model)
         return response.text.strip()
