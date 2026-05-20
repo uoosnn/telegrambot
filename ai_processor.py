@@ -177,9 +177,7 @@ class AIProcessor:
 
 # 출력 형식 (Output Format)
 - 인사말이나 부연 설명 없이 마크다운 텍스트만 출력하세요.
-- 문서 최상단에 Frontmatter(YAML)를 포함하세요.
 
-```yaml
 ---
 title: "{title_instruction if title_instruction else '트러블슈팅 기록'}"
 date: {kst_now.strftime('%Y-%m-%d')}
