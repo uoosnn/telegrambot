@@ -28,6 +28,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# httpx 모듈의 HTTP 요청 로그(INFO)가 터미널을 도배하는 것을 방지하기 위해 경고(WARNING) 레벨 이상만 출력하도록 설정
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
