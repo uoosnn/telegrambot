@@ -37,10 +37,37 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # 봇 시작 시간 기록
 BOT_START_TIME = datetime.now(ZoneInfo("Asia/Seoul"))
 
+# 봇 상태 파일 경로
+STATE_FILE = "bot_state.json"
+
 # 봇이 보낸 뉴스 메시지 보관소 (Reply 시 사용)
 pending_messages = {}
 # 게시 확인 대기 중인 콘텐츠 보관소
 pending_confirmations = {}
+
+def load_state():
+    global pending_messages, pending_confirmations
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                pending_messages = {int(k): v for k, v in data.get("pending_messages", {}).items()}
+                pending_confirmations = {int(k): v for k, v in data.get("pending_confirmations", {}).items()}
+        except Exception as e:
+            logger.error(f"Error loading state: {e}")
+
+def save_state():
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            import json
+            json.dump({
+                "pending_messages": pending_messages,
+                "pending_confirmations": pending_confirmations
+            }, f)
+    except Exception as e:
+        logger.error(f"Error saving state: {e}")
+
+load_state()
 
 # Initialize Modules
 try:
@@ -87,12 +114,14 @@ async def send_news_task(bot_app):
         return
         
     try:
-        # 1. 게임 뉴스 가져오기
-        game_news = news_scraper.fetch_game_news(limit=2)
-        # 2. 트렌딩 뉴스 가져오기
-        trending_news = news_scraper.fetch_trending_news(threshold=3)
+        # 1. 게임 뉴스 가져오기 (1개)
+        game_news = await asyncio.to_thread(news_scraper.fetch_game_news, limit=1)
+        # 2. 트렌딩 뉴스 가져오기 (2개)
+        trending_news = await asyncio.to_thread(news_scraper.fetch_trending_news, limit=2, threshold=2)
+        # 3. 일본 시사 뉴스 가져오기 (2개)
+        japan_news = await asyncio.to_thread(news_scraper.fetch_japan_news, limit=2)
         
-        all_news = game_news + trending_news
+        all_news = game_news + trending_news + japan_news
         
         sent_urls = load_sent_news()
         new_news = [n for n in all_news if n['url'] not in sent_urls]
@@ -120,6 +149,7 @@ async def send_news_task(bot_app):
                 logger.error(f"Error sending telegram message: {e}")
                 
         save_sent_news(sent_urls)
+        save_state()
                 
     except Exception as e:
         logger.error(f"Error fetching news: {e}")
@@ -183,7 +213,7 @@ async def _perform_post(update: Update, context: ContextTypes.DEFAULT_TYPE, fold
     if not title_instruction:
         await update.message.reply_text("⏳ 대화 내용을 분석하여 제목을 생성 중입니다...")
         try:
-            title_instruction = ai_processor.generate_title_from_history()
+            title_instruction = await asyncio.to_thread(ai_processor.generate_title_from_history)
         except Exception as e:
             logger.error(f"Error generating title: {e}")
             title_instruction = f"대화 기록 ({datetime.now().strftime('%Y-%m-%d')})"
@@ -192,17 +222,17 @@ async def _perform_post(update: Update, context: ContextTypes.DEFAULT_TYPE, fold
     await update.message.reply_text(f"⏳ 대화를 정리하여 {target_name}에 포스팅 중입니다... (주제: {title_instruction})")
     
     try:
-        markdown_content = ai_processor.generate_blog_post_from_history(title_instruction)
+        markdown_content = await asyncio.to_thread(ai_processor.generate_blog_post_from_history, title_instruction)
         
         # tech 포스트인 경우 태그 자동 수정
         if folder_name == "tech":
             markdown_content = markdown_content.replace("tags: [AI, 대화요약]", "tags: [Tech, AI, 기술분석]")
 
         await update.message.reply_text("🌐 영문 및 일문으로 자동 번역을 수행 중입니다...")
-        content_en = ai_processor.translate_blog_post(markdown_content, "English")
-        content_ja = ai_processor.translate_blog_post(markdown_content, "Japanese")
+        content_en = await asyncio.to_thread(ai_processor.translate_blog_post, markdown_content, "English")
+        content_ja = await asyncio.to_thread(ai_processor.translate_blog_post, markdown_content, "Japanese")
         
-        success, result = github_uploader.save_and_push(
+        success, result = await asyncio.to_thread(github_uploader.save_and_push,
             markdown_content, 
             title=title_instruction, 
             folder_name=folder_name,
@@ -242,7 +272,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
             try:
                 # 블로그 마크다운 생성
-                markdown_content = ai_processor.generate_blog_from_news(news_info, user_text)
+                markdown_content = await asyncio.to_thread(ai_processor.generate_blog_from_news, news_info, user_text)
                 
                 # 미리보기를 보여주고 확인 버튼 제공
                 preview = markdown_content[:500] + ("\n..." if len(markdown_content) > 500 else "")
@@ -261,6 +291,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     'markdown_content': markdown_content,
                     'news_info': news_info
                 }
+                save_state()
                 
                 await update.message.reply_text(preview_msg, reply_markup=reply_markup)
             except Exception as e:
@@ -280,7 +311,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 2. 일반 대화인 경우
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
     try:
-        reply_text = ai_processor.send_message(user_text)
+        reply_text = await asyncio.to_thread(ai_processor.send_message, user_text)
         await update.message.reply_text(reply_text)
     except Exception as e:
         logger.error(f"Error communicating with AI: {e}")
@@ -303,7 +334,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 고유 파일명 생성
         filename = f"img_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}.jpg"
         
-        success, result = github_uploader.save_image_and_push(file_bytes, filename)
+        success, result = await asyncio.to_thread(github_uploader.save_image_and_push, file_bytes, filename)
         if success:
             # 사용자의 캡션이 있는지 확인
             caption = update.message.caption or ""
@@ -312,7 +343,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context_msg += f"\n사진 설명(캡션): {caption}"
                 
             # AI의 대화 기록에 시스템(또는 사용자) 메시지로 몰래 주입하기 위해 send_message 활용
-            ai_processor.send_message(context_msg)
+            await asyncio.to_thread(ai_processor.send_message, context_msg)
             
             await update.message.reply_text(
                 f"✅ 이미지 업로드 완료!\n\nAI가 이 이미지를 인지했습니다. 바로 사용할 수 있는 마크다운 링크입니다:\n`{result}`",
@@ -349,10 +380,10 @@ async def handle_confirmation_callback(update: Update, context: ContextTypes.DEF
         await query.edit_message_text("🌐 영문 및 일문으로 자동 번역을 수행 중입니다...")
         
         try:
-            content_en = ai_processor.translate_blog_post(markdown_content, "English")
-            content_ja = ai_processor.translate_blog_post(markdown_content, "Japanese")
+            content_en = await asyncio.to_thread(ai_processor.translate_blog_post, markdown_content, "English")
+            content_ja = await asyncio.to_thread(ai_processor.translate_blog_post, markdown_content, "Japanese")
             
-            success, result = github_uploader.save_and_push(
+            success, result = await asyncio.to_thread(github_uploader.save_and_push,
                 markdown_content, 
                 translations={'en': content_en, 'ja': content_ja}
             )
@@ -362,6 +393,7 @@ async def handle_confirmation_callback(update: Update, context: ContextTypes.DEF
                 # 처리 완료 후 메모리에서 삭제
                 pending_confirmations.pop(reply_to_id, None)
                 pending_messages.pop(reply_to_id, None)
+                save_state()
             else:
                 await query.edit_message_text(f"❌ 깃허브 업로드 실패:\n{result}")
         except Exception as e:
@@ -371,6 +403,7 @@ async def handle_confirmation_callback(update: Update, context: ContextTypes.DEF
     elif data.startswith("cancel_post_"):
         reply_to_id = int(data.replace("cancel_post_", ""))
         pending_confirmations.pop(reply_to_id, None)
+        save_state()
         await query.edit_message_text("❌ 게시가 취소되었습니다.")
 
 
@@ -398,7 +431,7 @@ async def write_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     try:
         # 번역본 없이 바로 한국어 원본만 업로드 (translations 생략)
-        success, result = github_uploader.save_and_push(user_text, title=title)
+        success, result = await asyncio.to_thread(github_uploader.save_and_push,user_text, title=title)
         
         if success:
             await update.message.reply_text(f"✅ 블로그 수동 포스팅 성공!\n\n저장 경로: {result}\n\n*※ 자동 번역이 생략되었습니다. 나중에 `/sync` 명령어를 통해 일괄 번역하실 수 있습니다.*")
@@ -553,12 +586,12 @@ async def sync_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             # 필요한 경우에만 번역 수행
             if item["is_en_outdated"]:
-                content_en = ai_processor.translate_blog_post(content, "English")
+                content_en = await asyncio.to_thread(ai_processor.translate_blog_post, content, "English")
                 with open(item["en_path"], "w", encoding="utf-8") as f:
                     f.write(content_en)
             
             if item["is_ja_outdated"]:
-                content_ja = ai_processor.translate_blog_post(content, "Japanese")
+                content_ja = await asyncio.to_thread(ai_processor.translate_blog_post, content, "Japanese")
                 with open(item["ja_path"], "w", encoding="utf-8") as f:
                     f.write(content_ja)
             
@@ -619,7 +652,7 @@ def main():
     threading.Thread(target=run_scheduler, args=(loop, application), daemon=True).start()
 
     # 자동 커밋/푸시 감시자를 백그라운드 스레드에서 실행
-    threading.Thread(target=start_auto_push_watcher, daemon=True).start()
+    threading.Thread(target=start_auto_push_watcher, args=(application.bot, CHAT_ID), daemon=True).start()
 
     logger.info("Bot is running...")
     application.run_polling()

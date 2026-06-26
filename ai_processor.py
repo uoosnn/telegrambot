@@ -1,5 +1,6 @@
 import os
 import json
+import threading
 import google.generativeai as genai
 from google.api_core.exceptions import ResourceExhausted
 from datetime import datetime
@@ -50,6 +51,7 @@ class AIProcessor:
         
         self.chat_session = None
         self.usage_file = os.path.join(os.path.dirname(__file__), "api_usage.json")
+        self._usage_lock = threading.Lock()
         self._init_usage_stats()
         self.start_new_session()
 
@@ -64,14 +66,15 @@ class AIProcessor:
                 in_tokens = response.usage_metadata.prompt_token_count
                 out_tokens = response.usage_metadata.candidates_token_count
                 
-                with open(self.usage_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                
-                data["input_tokens"] += in_tokens
-                data["output_tokens"] += out_tokens
-                
-                with open(self.usage_file, 'w', encoding='utf-8') as f:
-                    json.dump(data, f)
+                with self._usage_lock:
+                    with open(self.usage_file, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    
+                    data["input_tokens"] += in_tokens
+                    data["output_tokens"] += out_tokens
+                    
+                    with open(self.usage_file, 'w', encoding='utf-8') as f:
+                        json.dump(data, f)
         except Exception:
             pass
 
