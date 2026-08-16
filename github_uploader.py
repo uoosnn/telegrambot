@@ -25,6 +25,35 @@ class GithubUploader:
             text = text[:-3]
         return text.strip()
 
+    def _format_markdown_for_lang(self, text, lang="ko"):
+        text = self._clean_markdown(text)
+        
+        fm_match = re.match(r'^---\r?\n([\s\S]*?)\r?\n---', text)
+        if not fm_match:
+            return text
+        
+        fm_text = fm_match.group(1).strip()
+        title_match = re.search(r'^title:\s*["\']?([^"\'\n]+)["\']?', fm_text, re.MULTILINE)
+        title = title_match.group(1).strip() if title_match else ""
+        
+        body = text[fm_match.end():].strip()
+        
+        if title:
+            if body.startswith('# '):
+                body = re.sub(r'^#\s+[^\r\n]+', f'# {title}', body)
+            else:
+                body = f'# {title}\n\n' + body
+        
+        timestamp_label = "게시된 시간:"
+        if lang == "en":
+            timestamp_label = "Posted:"
+        elif lang == "ja":
+            timestamp_label = "投稿日時:"
+            
+        body = re.sub(r'\*?(게시된 시간|Posted|投稿日時|投稿時間):\s*', f'*{timestamp_label} ', body)
+
+        return f"---\n{fm_text}\n---\n\n{body}\n"
+
     def save_and_push(self, markdown_content, title=None, folder_name="blog", translations=None):
         # Determine target folder
         target_dir = os.path.join(self.repo_path, folder_name)
@@ -34,17 +63,16 @@ class GithubUploader:
         if not title:
             title_match = re.search(r'title:\s*(.*)', markdown_content)
             title = title_match.group(1).strip() if title_match else "새로운_포스트"
-            # Remove quotes if AI added them so filename is clean
             if title.startswith('"') and title.endswith('"'):
                 title = title[1:-1]
         
         filename = self.generate_filename(title)
         filepath = os.path.join(target_dir, filename)
         
-        markdown_content = self._clean_markdown(markdown_content)
+        formatted_ko = self._format_markdown_for_lang(markdown_content, lang="ko")
         
         with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(markdown_content)
+            f.write(formatted_ko)
             
         added_files = [filepath]
 
@@ -55,9 +83,9 @@ class GithubUploader:
                 os.makedirs(lang_dir, exist_ok=True)
                 lang_filepath = os.path.join(lang_dir, filename)
                 
-                trans_content = self._clean_markdown(trans_content)
+                formatted_trans = self._format_markdown_for_lang(trans_content, lang=lang)
                 with open(lang_filepath, 'w', encoding='utf-8') as f:
-                    f.write(trans_content)
+                    f.write(formatted_trans)
                 added_files.append(lang_filepath)
             
         # Git commit and push
