@@ -1,92 +1,84 @@
 import os
 import json
-import threading
-import google.generativeai as genai
-from google.api_core.exceptions import ResourceExhausted
+import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import google.generativeai as genai
+from google.api_core.exceptions import ResourceExhausted
+
+from dynamo_manager import DynamoManager
+
+logger = logging.getLogger(__name__)
 
 class AIProcessor:
-    def __init__(self):
+    def __init__(self, dynamo_mgr=None):
         api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY is not set in environment variables.")
-        genai.configure(api_key=api_key)
-        
-        # 일반 대화용 모델: 자연스러운 대화를 위해 temperature 높임
-        chat_config = genai.types.GenerationConfig(
-            temperature=0.7,
-            top_p=0.9,
-            top_k=40
-        )
-        self.chat_model = genai.GenerativeModel(
-            'gemini-2.5-pro',
-            generation_config=chat_config,
-            system_instruction="당신은 친절하고 유능한 어시스턴트입니다. 자연스럽고 재미있게 대화하되, 사실에 기반하여 답변하세요."
-        )
-        
-        # 블로그 포스트 작성용 모델: 할루시네이션(환각)을 최소화하기 위해 temperature 낮춤
-        post_config = genai.types.GenerationConfig(
-            temperature=0.6,
-            top_p=0.8,
-            top_k=40
-        )
-        self.post_model = genai.GenerativeModel(
-            'gemini-2.5-pro',
-            generation_config=post_config,
-            system_instruction="당신은 사실 기반으로만 글을 작성하는 정확한 블로그 에디터입니다. 제공받은 정보 외에 임의의 사실을 절대 지어내지 마세요. 추측이나 불확실한 내용은 포함하지 마세요."
-        )
-        
-        # 단순 번역용 가성비 모델: 저렴하고 빠른 gemini-2.5-flash 사용
-        trans_config = genai.types.GenerationConfig(
-            temperature=0.3, # 번역은 창의성보다 정확성이 중요하므로 온도를 낮춤
-            top_p=0.8,
-            top_k=40
-        )
-        self.trans_model = genai.GenerativeModel(
-            'gemini-2.5-flash',
-            generation_config=trans_config,
-            system_instruction="당신은 원본의 형식과 마크다운 문법을 완벽히 보존하는 전문 번역가입니다."
-        )
-        
-        self.chat_session = None
-        self.usage_file = os.path.join(os.path.dirname(__file__), "api_usage.json")
-        self._usage_lock = threading.Lock()
-        self._init_usage_stats()
-        self.start_new_session()
+        self.dynamo_mgr = dynamo_mgr or DynamoManager()
+        self.chat_model = None
+        self.post_model = None
+        self.trans_model = None
 
-    def _init_usage_stats(self):
-        if not os.path.exists(self.usage_file):
-            with open(self.usage_file, 'w', encoding='utf-8') as f:
-                json.dump({"input_tokens": 0, "output_tokens": 0}, f)
+        if not api_key:
+            logger.warning("GEMINI_API_KEY is not set in environment variables.")
+            return
+
+        try:
+            genai.configure(api_key=api_key)
+            # 일반 대화용 모델
+            chat_config = genai.types.GenerationConfig(
+                temperature=0.7,
+                top_p=0.9,
+                top_k=40
+            )
+            self.chat_model = genai.GenerativeModel(
+                'gemini-2.5-pro',
+                generation_config=chat_config,
+                system_instruction="당신은 친절하고 유능한 어시스턴트입니다. 자연스럽고 재미있게 대화하되, 사실에 기반하여 답변하세요."
+            )
+            
+            # 블로그 포스트 작성용 모델
+            post_config = genai.types.GenerationConfig(
+                temperature=0.6,
+                top_p=0.8,
+                top_k=40
+            )
+            self.post_model = genai.GenerativeModel(
+                'gemini-2.5-pro',
+                generation_config=post_config,
+                system_instruction="당신은 사실 기반으로만 글을 작성하는 정확한 블로그 에디터입니다. 제공받은 정보 외에 임의의 사실을 절대 지어내지 마세요. 추측이나 불확실한 내용은 포함하지 마세요."
+            )
+            
+            # 단순 번역용 모델
+            trans_config = genai.types.GenerationConfig(
+                temperature=0.3,
+                top_p=0.8,
+                top_k=40
+            )
+            self.trans_model = genai.GenerativeModel(
+                'gemini-2.5-flash',
+                generation_config=trans_config,
+                system_instruction="당신은 원본의 형식과 마크다운 문법을 완벽히 보존하는 전문 번역가입니다."
+            )
+        except Exception as e:
+            logger.error(f"Error configuring Gemini: {e}")
+
 
     def _record_usage(self, response):
         try:
             if hasattr(response, 'usage_metadata'):
                 in_tokens = response.usage_metadata.prompt_token_count
                 out_tokens = response.usage_metadata.candidates_token_count
-                
-                with self._usage_lock:
-                    with open(self.usage_file, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                    
-                    data["input_tokens"] += in_tokens
-                    data["output_tokens"] += out_tokens
-                    
-                    with open(self.usage_file, 'w', encoding='utf-8') as f:
-                        json.dump(data, f)
-        except Exception:
-            pass
+                if self.dynamo_mgr:
+                    self.dynamo_mgr.record_usage(in_tokens, out_tokens)
+        except Exception as e:
+            logger.warning(f"Error recording token usage: {e}")
 
     def get_usage_stats(self):
-        try:
-            with open(self.usage_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            return {"input_tokens": 0, "output_tokens": 0}
+        if self.dynamo_mgr:
+            return self.dynamo_mgr.get_usage_stats()
+        return {"input_tokens": 0, "output_tokens": 0}
 
     def _generate_content_with_tracking(self, prompt, model=None):
-        """지정된 모델로 콘텐츠를 생성하고 사용량을 추적합니다. 기본값은 post_model."""
         if model is None:
             model = self.post_model
         try:
@@ -100,34 +92,70 @@ class AIProcessor:
                 raise Exception("API 지출 한도를 초과했습니다 (Quota Exceeded).")
             raise e
 
-    def start_new_session(self):
-        """새로운 대화 세션을 시작합니다 (기존 문맥 초기화)."""
-        self.chat_session = self.chat_model.start_chat(history=[])
+    def start_new_session(self, chat_id: int):
+        """특정 사용자의 대화 세션을 초기화합니다."""
+        if self.dynamo_mgr:
+            self.dynamo_mgr.clear_chat_history(chat_id)
         return "새로운 대화가 시작되었습니다. 무엇을 도와드릴까요?"
 
-    def send_message(self, message):
-        """사용자의 메시지를 AI에게 전송하고 응답을 받습니다."""
-        if not self.chat_session:
-            self.start_new_session()
+    def _sanitize_gemini_history(self, history: list):
+        sanitized = []
+        for item in history:
+            text = (item.get("text") or "").strip()
+            if not text:
+                continue
+            role = item.get("role", "user")
+            if role not in ["user", "model"]:
+                role = "user"
+            
+            if sanitized and sanitized[-1]["role"] == role:
+                sanitized[-1]["parts"][0] += f"\n\n{text}"
+            else:
+                sanitized.append({"role": role, "parts": [text]})
         
-        response = self.chat_session.send_message(message)
-        self._record_usage(response)
-        return response.text.strip()
+        while sanitized and sanitized[0]["role"] != "user":
+            sanitized.pop(0)
+            
+        return sanitized
 
-    def _get_history_text(self):
-        """현재 대화 세션의 히스토리를 텍스트로 변환합니다."""
-        if not self.chat_session or not self.chat_session.history:
+    def send_message(self, message: str, chat_id: int):
+        """대화 히스토리를 유지하며 AI와 대화합니다."""
+        history = self.dynamo_mgr.get_chat_history(chat_id) if self.dynamo_mgr else []
+        gemini_history = self._sanitize_gemini_history(history)
+
+        try:
+            chat_session = self.chat_model.start_chat(history=gemini_history)
+            response = chat_session.send_message(message)
+            self._record_usage(response)
+            reply_text = response.text.strip()
+        except Exception as e:
+            logger.error(f"Error in Gemini send_message: {e}")
+            # 만약 히스토리 충돌 등의 문제라면 히스토리 없이 단독 생성 시도
+            fallback_response = self.chat_model.generate_content(message)
+            self._record_usage(fallback_response)
+            reply_text = fallback_response.text.strip()
+
+        history.append({"role": "user", "text": message})
+        history.append({"role": "model", "text": reply_text})
+        if self.dynamo_mgr:
+            self.dynamo_mgr.save_chat_history(chat_id, history)
+
+        return reply_text
+
+
+    def _get_history_text(self, chat_id: int):
+        history = self.dynamo_mgr.get_chat_history(chat_id) if self.dynamo_mgr else []
+        if not history:
             return ""
         lines = []
-        for message in self.chat_session.history:
-            role = "사용자" if message.role == "user" else "AI"
-            text = message.parts[0].text if message.parts else ""
+        for item in history:
+            role = "사용자" if item.get("role") == "user" else "AI"
+            text = item.get("text", "")
             lines.append(f"[{role}]: {text}")
         return "\n\n".join(lines)
 
-    def generate_title_from_history(self):
-        """현재까지의 대화 내용을 분석하여 블로그 포스트에 적합한 제목을 자동 생성합니다."""
-        history_text = self._get_history_text()
+    def generate_title_from_history(self, chat_id: int):
+        history_text = self._get_history_text(chat_id)
         if not history_text:
             return "대화 기록"
 
@@ -143,14 +171,11 @@ class AIProcessor:
 {history_text}
 """
         response = self._generate_content_with_tracking(prompt)
-        title = response.text.strip()
-        # 혹시 따옴표가 붙어 있다면 제거
-        title = title.strip('"').strip("'").strip()
+        title = response.text.strip().strip('"').strip("'").strip()
         return title if title else "대화 기록"
 
-    def generate_blog_post_from_history(self, title_instruction):
-        """현재까지의 대화 내용을 바탕으로 블로그 포스트를 생성합니다."""
-        history_text = self._get_history_text()
+    def generate_blog_post_from_history(self, title_instruction: str, chat_id: int):
+        history_text = self._get_history_text(chat_id)
         if not history_text:
             return "대화 기록이 없습니다. 먼저 대화를 나누어 주세요."
 
@@ -179,7 +204,7 @@ class AIProcessor:
    - 프로젝트 고유의 특이한(일반적이지 않은) 디렉토리 이름이 나오는 경우 `example_a`, `example_b` 등의 이름으로 변경하세요.
 5. **코드 및 가독성 (Markdown)**:
    - 관련 설정값이나 명령어가 있다면 반드시 마크다운 코드 블록(```)으로 묶고, 인라인 코드(`)를 적극 활용하세요.
-   - [대화 기록] 중에 마크다운 형태의 이미지 링크(`![...](/images/...)`)가 포함되어 있다면, 글의 흐름상 가장 적절한 위치(예: 에러 원인 설명부, 해결 후 화면 등)에 해당 링크를 반드시 포함하여 시각적 이해도를 높이세요.
+   - [대화 기록] 중에 마크다운 형태의 이미지 링크(`![...](/images/...)`)가 포함되어 있다면, 글의 흐름상 가장 적절한 위치에 해당 링크를 반드시 포함하여 시각적 이해도를 높이세요.
 6. **분량 및 가독성 최적화**: 
    - 원본 대화 내용이 빈약하다면 억지로 길게 쓰지 말고 핵심만 간결히 요약하세요. 
    - 복잡한 단계나 설명은 번호 매기기(List)나 표(Table)를 적극 활용하여 가독성을 높이세요.
@@ -212,7 +237,6 @@ tags: [Tech, Troubleshooting, Incident Report]
         return response.text.strip()
 
     def generate_blog_from_news(self, news_data, user_comment):
-        """뉴스 원본 데이터와 사용자의 코멘트를 바탕으로 블로그 포스트 생성"""
         kst_now = datetime.now(ZoneInfo("Asia/Seoul"))
         prompt = f"""
 당신은 기술 및 사회 트렌드를 깊이 있게 분석하는 전문 블로그 에디터입니다.
@@ -249,7 +273,6 @@ tags: [Tech, Troubleshooting, Incident Report]
         return response.text.strip()
 
     def translate_blog_post(self, markdown_text, target_language):
-        """기존 마크다운 포스트를 지정된 언어로 번역합니다. (프론트매터 및 마크다운 구조 유지)"""
         timestamp_label = "Posted:" if "eng" in target_language.lower() or "en" in target_language.lower() else ("投稿日時:" if "jap" in target_language.lower() or "ja" in target_language.lower() else "게시된 시간:")
         prompt = f"""
 당신은 완벽한 IT/블로그 전문 번역가입니다.
@@ -266,6 +289,5 @@ tags: [Tech, Troubleshooting, Incident Report]
 [원본 마크다운]
 {markdown_text}
 """
-        # 번역에는 훨씬 저렴하고 빠른 trans_model (gemini-2.5-flash) 사용
         response = self._generate_content_with_tracking(prompt, model=self.trans_model)
         return response.text.strip()

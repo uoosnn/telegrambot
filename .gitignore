@@ -4,3 +4,6 @@ __pycache__/
 .venv/
 venv/
 nohup.out
+build_package/
+test_linux_build/
+*.zip

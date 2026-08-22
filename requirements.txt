@@ -1,7 +1,7 @@
 python-telegram-bot
 google-generativeai
-gitpython
-python-dotenv
-schedule
+PyGithub
+boto3
 feedparser
 beautifulsoup4
+python-dotenv

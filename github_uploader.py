@@ -1,17 +1,32 @@
 import os
 import re
-from datetime import datetime
-from git import Repo
+import logging
+from github import Github, GithubException, Auth
+
+logger = logging.getLogger(__name__)
 
 class GithubUploader:
-    def __init__(self):
-        self.repo_path = os.getenv("TARGET_REPO_PATH", "/source/uoosnn.github.io")
-        self.repo = Repo(self.repo_path)
-    
+    def __init__(self, token=None, repo_name=None):
+        self.token = token or os.getenv("GITHUB_TOKEN")
+        self.repo_name = repo_name or os.getenv("TARGET_REPO", "uoosnn/uoosnn.github.io")
+        self.branch = os.getenv("TARGET_BRANCH", "main")
+        
+        if not self.token:
+            logger.warning("GITHUB_TOKEN is not set.")
+            self.github = None
+            self.repo = None
+        else:
+            try:
+                auth = Auth.Token(self.token)
+                self.github = Github(auth=auth)
+                self.repo = self.github.get_repo(self.repo_name)
+            except Exception as e:
+                logger.error(f"Failed to initialize Github client: {e}")
+                self.github = None
+                self.repo = None
+
     def generate_filename(self, title):
-        # Remove invalid characters for filename
         clean_title = re.sub(r'[\\/*?:"<>|]', "", title)
-        # Ensure it's not too long
         clean_title = clean_title[:50].strip()
         return f"{clean_title}.md"
 
@@ -54,68 +69,79 @@ class GithubUploader:
 
         return f"---\n{fm_text}\n---\n\n{body}\n"
 
-    def save_and_push(self, markdown_content, title=None, folder_name="blog", translations=None):
-        # Determine target folder
-        target_dir = os.path.join(self.repo_path, folder_name)
-        os.makedirs(target_dir, exist_ok=True)
-        
-        # Extract title from markdown if not provided
-        if not title:
-            title_match = re.search(r'title:\s*(.*)', markdown_content)
-            title = title_match.group(1).strip() if title_match else "새로운_포스트"
-            if title.startswith('"') and title.endswith('"'):
-                title = title[1:-1]
-        
-        filename = self.generate_filename(title)
-        filepath = os.path.join(target_dir, filename)
-        
-        formatted_ko = self._format_markdown_for_lang(markdown_content, lang="ko")
-        
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(formatted_ko)
+    def _commit_or_update_file(self, path, content, commit_message):
+        """GitHub REST API로 파일 생성 또는 업데이트"""
+        if not self.repo:
+            raise Exception("GitHub repository is not configured.")
             
-        added_files = [filepath]
-
-        # Save translations if provided
-        if translations:
-            for lang, trans_content in translations.items():
-                lang_dir = os.path.join(self.repo_path, lang, folder_name)
-                os.makedirs(lang_dir, exist_ok=True)
-                lang_filepath = os.path.join(lang_dir, filename)
-                
-                formatted_trans = self._format_markdown_for_lang(trans_content, lang=lang)
-                with open(lang_filepath, 'w', encoding='utf-8') as f:
-                    f.write(formatted_trans)
-                added_files.append(lang_filepath)
-            
-        # Git commit and push
         try:
-            for file in added_files:
-                self.repo.git.add(file)
-            self.repo.index.commit(f"docs: Auto post from Telegram Bot ({title})")
-            origin = self.repo.remote(name='origin')
-            origin.push()
-            return True, filepath
+            # 기존 파일 확인
+            try:
+                existing = self.repo.get_contents(path, ref=self.branch)
+                self.repo.update_file(
+                    path=path,
+                    message=commit_message,
+                    content=content,
+                    sha=existing.sha,
+                    branch=self.branch
+                )
+                logger.info(f"Updated file on GitHub: {path}")
+            except GithubException as ge:
+                if ge.status == 404:
+                    self.repo.create_file(
+                        path=path,
+                        message=commit_message,
+                        content=content,
+                        branch=self.branch
+                    )
+                    logger.info(f"Created file on GitHub: {path}")
+                else:
+                    raise ge
+            return True
         except Exception as e:
-            print(f"Git Push Error: {e}")
+            logger.error(f"Error committing file {path} to GitHub: {e}")
+            raise e
+
+    def save_and_push(self, markdown_content, title=None, folder_name="blog", translations=None):
+        if not self.repo:
+            return False, "GitHub repository connection not configured (check GITHUB_TOKEN)."
+
+        if not title:
+            title_match = re.search(r'title:\s*["\']?(.*?)["\']?(\n|$)', markdown_content)
+            title = title_match.group(1).strip() if title_match else "새로운_포스트"
+
+        filename = self.generate_filename(title)
+        filepath = f"{folder_name}/{filename}"
+        formatted_ko = self._format_markdown_for_lang(markdown_content, lang="ko")
+
+        try:
+            # 1. 한국어 원본 커밋
+            commit_msg = f"docs: Auto post from Telegram Bot ({title})"
+            self._commit_or_update_file(filepath, formatted_ko, commit_msg)
+            uploaded_paths = [filepath]
+
+            # 2. 다국어 번역본 커밋
+            if translations:
+                for lang, trans_content in translations.items():
+                    lang_path = f"{lang}/{folder_name}/{filename}"
+                    formatted_trans = self._format_markdown_for_lang(trans_content, lang=lang)
+                    trans_commit_msg = f"docs: Auto translate {lang} ({title})"
+                    self._commit_or_update_file(lang_path, formatted_trans, trans_commit_msg)
+                    uploaded_paths.append(lang_path)
+
+            return True, f"GitHub ({', '.join(uploaded_paths)})"
+        except Exception as e:
             return False, str(e)
 
     def save_image_and_push(self, file_bytes, filename):
-        target_dir = os.path.join(self.repo_path, "public", "images")
-        os.makedirs(target_dir, exist_ok=True)
-        
-        filepath = os.path.join(target_dir, filename)
-        
-        with open(filepath, 'wb') as f:
-            f.write(file_bytes)
-            
+        if not self.repo:
+            return False, "GitHub repository connection not configured (check GITHUB_TOKEN)."
+
+        filepath = f"public/images/{filename}"
+        commit_msg = f"docs: Upload image {filename}"
+
         try:
-            self.repo.git.add(filepath)
-            self.repo.index.commit(f"docs: Upload image {filename}")
-            origin = self.repo.remote(name='origin')
-            origin.push()
-            # 마크다운 링크 반환
+            self._commit_or_update_file(filepath, file_bytes, commit_msg)
             return True, f"![이미지](/images/{filename})"
         except Exception as e:
-            print(f"Git Push Error: {e}")
             return False, str(e)
