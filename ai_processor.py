@@ -215,11 +215,18 @@ class AIProcessor:
 - 인사말이나 부연 설명 없이 마크다운 텍스트만 출력하세요.
 - **[매우 중요]: 절대로 결과물 전체를 감싸는 ```yaml 이나 ```markdown 등 코드 블록 선언을 하지 마세요. 출력은 반드시 `---` 기호로 시작해야 합니다.**
 - **[매우 중요]: `---` 프론트매터 블록이 끝난 바로 다음 줄(본문 최상단)에는 반드시 `# {title_instruction if title_instruction else '트러블슈팅 기록'}` 제목 헤딩을 주입하세요.**
+- **Frontmatter 요구사항**:
+  - `title`: 명확하고 간결한 글 제목 (큰따옴표 필수)
+  - `description`: 글의 핵심 내용과 해결 과정을 요약한 1~2문장의 설명 (SEO 및 태그 카드 설명용, 큰따옴표 필수)
+  - `date`: `{kst_now.strftime('%Y-%m-%d')}`
+  - `tags`: 본문 주제에 맞추어 아래 태그 풀(Tag Pool) 중에서 가장 관련성 높은 3~5개를 배열 형태로 선택
+    - 태그 풀: `Tech, Troubleshooting, AWS, Cloud, Security, Incident Report, Forensic, Serverless, Lambda, Linux, Windows, WSL, Database, MySQL, MSSQL, Architecture, Network, Performance, Automation, VitePress, AI`
 
 ---
 title: "{title_instruction if title_instruction else '트러블슈팅 기록'}"
+description: "글의 핵심 문제와 해결 과정을 간결히 요약한 1~2문장"
 date: {kst_now.strftime('%Y-%m-%d')}
-tags: [Tech, Troubleshooting, Incident Report]
+tags: [Tech, Troubleshooting, AWS, Linux]
 ---
 
 # {title_instruction if title_instruction else '트러블슈팅 기록'}
@@ -260,8 +267,9 @@ tags: [Tech, Troubleshooting, Incident Report]
    - 최상단에 반드시 아래 형식의 Frontmatter를 포함하세요.
      ---
      title: "매력적인 제목" (양끝 큰따옴표 필수)
+     description: "뉴스 핵심 내용과 인사이트를 요약한 1~2문장" (양끝 큰따옴표 필수)
      date: {kst_now.strftime('%Y-%m-%d')}
-     tags: [뉴스, {news_data.get('category', 'trend')}]
+     tags: [Blog, 뉴스, {news_data.get('category', 'Trend')}]
      ---
    - `---` 프론트매터 직후 본문 최상단 첫 줄에는 반드시 `# 매력적인 제목` H1 헤딩을 삽입하세요.
    - 부연 설명이나 인사말 없이 오직 마크다운 텍스트만 출력하세요.
@@ -279,7 +287,7 @@ tags: [Tech, Troubleshooting, Incident Report]
 아래 제공된 [원본 마크다운] 문서를 **{target_language}**로 번역해 주세요.
 
 [요구사항]
-1. 최상단의 Frontmatter(yaml 형식) 블록은 그대로 유지하되, `title`의 값은 해당 언어로 번역하고 **반드시 큰따옴표("")**로 묶어주세요. (`date`와 `tags`는 원본과 동일하게 유지)
+1. 최상단의 Frontmatter(yaml 형식) 블록에서 `title`과 `description`의 값은 해당 언어로 번역하고 **반드시 큰따옴표("")**로 묶어주세요. (`date`와 `tags`는 원본과 동일하게 유지)
 2. `---` 프론트매터 바로 다음 줄에 나오는 `# [제목]` 헤딩도 자연스러운 **{target_language}**로 번역하세요.
 3. 마크다운의 구조(코드 블록, 인용구, 링크, 볼드체 등)는 절대 훼손하지 마세요.
 4. 글 하단의 타임스탬프 문구인 `*게시된 시간: YYYY-MM-DD HH:mm:ss*`는 **`*{timestamp_label} YYYY-MM-DD HH:mm:ss*`** 형식으로 정합성을 맞추어 번역하세요.
