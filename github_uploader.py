@@ -267,3 +267,102 @@ class GithubUploader:
         except Exception as e:
             return False, str(e)
 
+    def save_and_push_draft(self, markdown_content, title=None, folder_name="blog"):
+        """draft: true 속성을 주입하여 초안으로 저장 및 푸시 (검색엔진/목록 숨김)"""
+        if not re.search(r'^draft:\s*', markdown_content, re.MULTILINE):
+            if markdown_content.startswith('---'):
+                parts = markdown_content.split('---', 2)
+                if len(parts) >= 3:
+                    markdown_content = f"---{parts[1]}\ndraft: true\n---{parts[2]}"
+            else:
+                markdown_content = f"---\ndraft: true\n---\n\n{markdown_content}"
+        return self.save_and_push(markdown_content, title=title, folder_name=folder_name, translations=None)
+
+    def find_post_files(self, keyword):
+        """키워드나 파일명으로 블로그 포스트 파일 검색"""
+        if not self.repo:
+            return []
+        found = []
+        for folder in ["tech", "blog"]:
+            try:
+                contents = self.repo.get_contents(folder, ref=self.branch)
+                for item in contents:
+                    if item.name.endswith(".md") and item.name != "index.md":
+                        if keyword.lower() in item.name.lower():
+                            found.append((folder, item.name, item.sha))
+            except Exception:
+                pass
+        return found
+
+    def unpublish_post(self, keyword):
+        """게시글의 frontmatter에 draft: true를 추가하여 비공개/색인제외 전환"""
+        if not self.repo:
+            return False, "GitHub 저장소 미연결"
+
+        matches = self.find_post_files(keyword)
+        if not matches:
+            return False, f"'{keyword}'에 해당하는 게시글을 찾을 수 없습니다."
+        if len(matches) > 1:
+            names = [f"[{f}] {n}" for f, n, _ in matches[:5]]
+            return False, f"일치하는 글이 여러 개 있습니다. 더 정확한 제목을 입력해 주세요:\n" + "\n".join(names)
+
+        folder, filename, _ = matches[0]
+        updated_paths = []
+
+        for prefix in ["", "ja/", "en/"]:
+            path = f"{prefix}{folder}/{filename}"
+            try:
+                file_obj = self.repo.get_contents(path, ref=self.branch)
+                content = file_obj.decoded_content.decode("utf-8")
+                if not re.search(r'^draft:\s*', content, re.MULTILINE):
+                    if content.startswith('---'):
+                        parts = content.split('---', 2)
+                        if len(parts) >= 3:
+                            new_content = f"---{parts[1]}\ndraft: true\n---{parts[2]}"
+                    else:
+                        new_content = f"---\ndraft: true\n---\n\n{content}"
+
+                    self.repo.update_file(
+                        path=path,
+                        message=f"chore: Unpublish post (draft: true) - {filename}",
+                        content=new_content,
+                        sha=file_obj.sha,
+                        branch=self.branch
+                    )
+                    updated_paths.append(path)
+            except Exception as e:
+                logger.warning(f"Failed to unpublish {path}: {e}")
+
+        return True, f"비공개(초안) 전환 완료:\n" + "\n".join(updated_paths)
+
+    def delete_post(self, keyword):
+        """게시글을 KO, EN, JA 3개 언어에서 영구 삭제"""
+        if not self.repo:
+            return False, "GitHub 저장소 미연결"
+
+        matches = self.find_post_files(keyword)
+        if not matches:
+            return False, f"'{keyword}'에 해당하는 게시글을 찾을 수 없습니다."
+        if len(matches) > 1:
+            names = [f"[{f}] {n}" for f, n, _ in matches[:5]]
+            return False, f"일치하는 글이 여러 개 있습니다. 더 정확한 제목을 입력해 주세요:\n" + "\n".join(names)
+
+        folder, filename, _ = matches[0]
+        deleted_paths = []
+
+        for prefix in ["", "ja/", "en/"]:
+            path = f"{prefix}{folder}/{filename}"
+            try:
+                file_obj = self.repo.get_contents(path, ref=self.branch)
+                self.repo.delete_file(
+                    path=path,
+                    message=f"chore: Delete post - {filename}",
+                    sha=file_obj.sha,
+                    branch=self.branch
+                )
+                deleted_paths.append(path)
+            except Exception as e:
+                logger.warning(f"Failed to delete {path}: {e}")
+
+        return True, f"삭제 완료:\n" + "\n".join(deleted_paths)
+

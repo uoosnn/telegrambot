@@ -182,45 +182,33 @@ class AIProcessor:
         kst_now = datetime.now(ZoneInfo("Asia/Seoul"))
 
         prompt = f"""
-# 역할 (Role)
-당신은 고객 응대 메일이나 CS 기록을 분석하여, 이를 철저히 **'엔지니어 시점의 깊이 있는 기술 블로그(Troubleshooting Log)'**로 탈바꿈시키는 10년 차 시니어 테크니컬 에디터입니다.
+# 역할 (Role & Anti-Slop Philosophy)
+당신은 현업 시스템 및 클라우드 엔지니어링 10년 차 수석 테크니컬 에디터입니다.
+당신의 목표는 CS/메일/대화 기록을 **'AI Slop(군더더기, 상투어, 억지 구조)이 0%인 순도 높은 실전 트러블슈팅 및 엔지니어링 기술 문서'**로 탈바꿈시키는 것입니다.
 
-# 데이터의 본질 및 변환 목표 (Critical Task)
-- 입력되는 [대화 기록]은 **고객에게 상황을 안내하기 위해 작성된 메일/대화**입니다.
-- **절대 메일 내용을 단순히 요약하거나 정돈하는 수준에 머무르지 마세요.**
-- 고객 응대용 표현("불편을 드려 죄송합니다", "조치 완료되었습니다", "문의하신 내용" 등)은 완벽히 제거하고, 이 사건의 이면에 있는 **'기술적 원인'과 '엔지니어의 문제 해결 과정'**에만 집중하여 완전히 새로운 관점의 글을 작성하세요.
-
-# 지시사항 (Instructions)
-1. **관점 전환 (POV Shift)**:
-   - "고객에게 이렇게 안내했다"가 아니라, **"시스템에서 이런 에러가 발생했고, 우리는 이렇게 디버깅해서 해결했다"**는 1인칭 개발팀/엔지니어의 관점(평어체: ~했다, ~이다)으로 서술하세요.
-2. **기술적 딥다이브 (Why & How)**:
-   - 메일에 단편적으로 적힌 조치 결과를 바탕으로 기술적 맥락을 확장하세요.
-   - '어떤 원리로 장애가 발생했는지', '왜 이런 조치 방법을 선택했는지' 논리적으로 전개하세요.
-3. **용어 일반화 및 표준화**:
-   - 특정 고객사 이름은 익명 처리(예: `A사`, `특정 클라이언트`)하고, 벤더 종속적인 솔루션명(예: CDP 백업, Sophos 등)은 범용적인 기술 용어(백업, 안티바이러스 등)로 순화하세요.
-4. **민감 정보 마스킹 및 치환**:
-   - 도메인 이름이 나오는 경우 무조건 `example.com`으로 치환하세요.
-   - IP 주소가 나오는 경우 무조건 `x.x.x.x`로 치환하세요. 만약 서로 다른 IP가 두 개 이상 등장한다면 `x.x.x.1`, `x.x.x.2`와 같이 숫자를 붙여 구분하세요.
-   - 프로젝트 고유의 특이한(일반적이지 않은) 디렉토리 이름이 나오는 경우 `example_a`, `example_b` 등의 이름으로 변경하세요.
-5. **코드 및 가독성 (Markdown)**:
-   - 관련 설정값이나 명령어가 있다면 반드시 마크다운 코드 블록(```)으로 묶고, 인라인 코드(`)를 적극 활용하세요.
-   - [대화 기록] 중에 마크다운 형태의 이미지 링크(`![...](/images/...)`)가 포함되어 있다면, 글의 흐름상 가장 적절한 위치에 해당 링크를 반드시 포함하여 시각적 이해도를 높이세요.
-6. **분량 및 가독성 최적화**: 
-   - 원본 대화 내용이 빈약하다면 억지로 길게 쓰지 말고 핵심만 간결히 요약하세요. 
-   - 복잡한 단계나 설명은 번호 매기기(List)나 표(Table)를 적극 활용하여 가독성을 높이세요.
-7. **SEO 최적화**: 트러블슈팅과 관련된 핵심 기술 키워드를 본문 내에 자연스럽게 3~4회 이상 배치하세요.
-8. **엄격한 팩트 체크**: 글을 재구성하되, [대화 기록]에 없는 전혀 다른 기술적 사실이나 가짜 원인을 지어내지는 마세요.
+# [CRITICAL] 5대 슬롭 방지 규칙 (Zero-Slop Iron Rules)
+1. **금지어 및 상투적 패턴 (Negative Constraints)**:
+   - "이 트러블슈팅 로그는 ~하기 위해 작성되었다", "최근 ~의 발전으로 인해", "디지털 환경에서"
+   - "결론적으로,", "요약하자면,", "궁극적으로,", "~인지하는 것이 얼마나 중요한지 보여주었다"
+   - 위와 같은 AI 특유의 미사여구나 도덕 교과서식 훈계조 문장을 절대 사용하지 마세요.
+2. **1줄 요약 팁 박스 필수 (::: tip)**:
+   - H1 제목 바로 아래에 문제와 핵심 원인/해결책을 1~2문장으로 압축한 `::: tip 1줄 요약` 컨테이너를 반드시 삽입하세요.
+3. **1차 팩트 중심 전개 (No Hallucination)**:
+   - [대화 기록]에 등장하는 실제 에러 메시지, 로그, 설정값, 명령어를 글의 중심에 두세요.
+   - 대화에 없는 가상의 에러 코드나 허위 명령어를 소설처럼 날조하지 마세요.
+4. **결론 포맷 (핵심 체크포인트 / Gotchas)**:
+   - 글의 마지막은 장황한 감상이 아닌, 실무자가 동일 상황에서 기억해야 할 **'## 핵심 체크포인트 (Gotchas)'** 2~3개 불렛포인트로 명쾌하게 마무리하세요.
+5. **SEO 키워드 억지 볼드체 금지**:
+   - 키워드를 인위적으로 볼드 처리하지 말고, 자연스러운 기술 용어로 서술하세요.
 
 # 출력 형식 (Output Format)
 - 인사말이나 부연 설명 없이 마크다운 텍스트만 출력하세요.
 - **[매우 중요]: 절대로 결과물 전체를 감싸는 ```yaml 이나 ```markdown 등 코드 블록 선언을 하지 마세요. 출력은 반드시 `---` 기호로 시작해야 합니다.**
-- **[매우 중요]: `---` 프론트매터 블록이 끝난 바로 다음 줄(본문 최상단)에는 반드시 `# {title_instruction if title_instruction else '트러블슈팅 기록'}` 제목 헤딩을 주입하세요.**
 - **Frontmatter 요구사항**:
-  - `title`: 명확하고 간결한 글 제목 (큰따옴표 필수)
-  - `description`: 글의 핵심 내용과 해결 과정을 요약한 1~2문장의 설명 (SEO 및 태그 카드 설명용, 큰따옴표 필수)
-  - `date`: `{kst_now.strftime('%Y-%m-%d')}`
-  - `tags`: 본문 주제에 맞추어 아래 태그 풀(Tag Pool) 중에서 가장 관련성 높은 3~5개를 배열 형태로 선택
-    - 태그 풀: `Tech, Troubleshooting, AWS, Cloud, Security, Incident Report, Forensic, Serverless, Lambda, Linux, Windows, WSL, Database, MySQL, MSSQL, Architecture, Network, Performance, Automation, VitePress, AI`
+  - `title`: 명확하고 직관적인 글 제목 (큰따옴표 필수)
+  - `description`: 글의 핵심 내용과 해결 과정을 요약한 1~2문장의 설명 (큰따옴표 필수)
+  - `date`: {kst_now.strftime('%Y-%m-%d')}
+  - `tags`: 본문 주제에 맞추어 태그 풀(`Tech, Troubleshooting, AWS, Cloud, Security, Incident Report, Forensic, Serverless, Lambda, Linux, Windows, WSL, Database, MySQL, MSSQL, Architecture, Network, Performance, Automation, VitePress, AI`)에서 3~5개 선택
 
 ---
 title: "{title_instruction if title_instruction else '트러블슈팅 기록'}"
@@ -231,12 +219,15 @@ tags: [Tech, Troubleshooting, AWS, Linux]
 
 # {title_instruction if title_instruction else '트러블슈팅 기록'}
 
-문서의 가장 마지막 줄에는 아래 문구를 출력하세요.
+::: tip 1줄 요약
+문제 현상과 핵심 원인 및 해결 조치를 1~2문장으로 압축
+:::
+
+(본문 내용: 인시던트 개요 -> 원인 분석 -> 실전 복구/명령어 -> ## 핵심 체크포인트)
 
 ---
 *게시된 시간: {kst_now.strftime('%Y-%m-%d %H:%M:%S')}*
 
-입력 데이터 (Input Data: 고객 안내 메일 기반)
 [대화 기록]
 {history_text}
 """
@@ -246,8 +237,8 @@ tags: [Tech, Troubleshooting, AWS, Linux]
     def generate_blog_from_news(self, news_data, user_comment):
         kst_now = datetime.now(ZoneInfo("Asia/Seoul"))
         prompt = f"""
-당신은 기술 및 사회 트렌드를 깊이 있게 분석하는 전문 블로그 에디터입니다.
-아래의 [뉴스 원본]과 [나의 코멘트]를 결합하여, 독자에게 인사이트를 제공하는 훌륭한 마크다운(Markdown) 포스트를 작성해 주세요.
+당신은 기술 및 산업 트렌드를 날카롭게 분석하는 전문 테크 칼럼니스트입니다.
+아래의 [뉴스 원본]과 [나의 코멘트]를 결합하여, 불필요한 미사여구(AI Slop) 없이 실질적인 인사이트를 전달하는 콤팩트한 마크다운 칼럼을 작성해 주세요.
 
 [뉴스 원본]
 - 제목: {news_data.get('title')}
@@ -256,26 +247,32 @@ tags: [Tech, Troubleshooting, AWS, Linux]
 [나의 코멘트]
 {user_comment}
 
-[작성 지침 및 요구사항]
-1. **톤앤매너**: 블로그 독자를 대상으로 하는 전문적이고 분석적인 평어체(~다, ~이다, ~했다)를 사용하세요.
-2. **구조와 융합**: 기계적으로 '뉴스 요약'과 '내 생각'을 분리하지 마세요. 뉴스 핵심 내용을 요약하면서, 사용자의 코멘트를 자연스럽게 본문에 녹여내어 하나의 완성된 칼럼처럼 작성하세요. 마지막에는 원문 링크를 포함한 결론으로 마무리하세요.
-3. **가독성 및 SEO**: 
-   - 내용이 길어질 경우 소제목(##)과 글머리 기호(-), 또는 표(Table)를 적절히 활용하세요.
-   - 검색 엔진 최적화(SEO)를 위해, 글의 핵심 키워드를 본문에 자연스럽게 3~4회 이상 배치하세요.
-4. **팩트 준수**: 제공된 [뉴스 원본]과 [나의 코멘트] 범위를 벗어난 거짓 정보(할루시네이션)를 지어내지 마세요.
-5. **포맷팅 강제**:
-   - 최상단에 반드시 아래 형식의 Frontmatter를 포함하세요.
-     ---
-     title: "매력적인 제목" (양끝 큰따옴표 필수)
-     description: "뉴스 핵심 내용과 인사이트를 요약한 1~2문장" (양끝 큰따옴표 필수)
-     date: {kst_now.strftime('%Y-%m-%d')}
-     tags: [Blog, 뉴스, {news_data.get('category', 'Trend')}]
-     ---
-   - `---` 프론트매터 직후 본문 최상단 첫 줄에는 반드시 `# 매력적인 제목` H1 헤딩을 삽입하세요.
-   - 부연 설명이나 인사말 없이 오직 마크다운 텍스트만 출력하세요.
-   - 글의 가장 마지막 줄에는 반드시 아래 문구를 추가하세요.
-     ---
-     *게시된 시간: {kst_now.strftime('%Y-%m-%d %H:%M:%S')}*
+[작성 지침]
+1. **슬롭 금지**: 뻔한 거시적 서두("현대 IT 사회에서...", "급변하는 시대에...") 및 상투적 결론("~는 중요한 시사점을 던져준다")을 철저히 배제하세요.
+2. **사용자 코멘트 중심**: 뉴스는 핵심 사실만 2~3문장으로 압축하고, 글의 70% 이상을 [나의 코멘트]에 담긴 실무자적 시각과 해석에 집중하여 전개하세요.
+3. **포맷**:
+   - 최상단 Frontmatter (`title`, `description`, `date`, `tags`)
+   - H1 헤딩 직후 `::: tip 핵심 인사이트` 박스 포함
+   - 마지막 줄은 원문 링크 및 타임스탬프
+
+---
+title: "직관적이고 명확한 제목"
+description: "핵심 인사이트 요약 1~2문장"
+date: {kst_now.strftime('%Y-%m-%d')}
+tags: [Blog, Tech, {news_data.get('category', 'Trend')}]
+---
+
+# 직관적이고 명확한 제목
+
+::: tip 핵심 인사이트
+칼럼의 핵심 주장 및 관점 요약
+:::
+
+(본문 내용)
+
+---
+*원문 출처: [{news_data.get('title')}]({news_data.get('url')})*
+*게시된 시간: {kst_now.strftime('%Y-%m-%d %H:%M:%S')}*
 """
         response = self._generate_content_with_tracking(prompt)
         return response.text.strip()
@@ -283,18 +280,16 @@ tags: [Tech, Troubleshooting, AWS, Linux]
     def translate_blog_post(self, markdown_text, target_language):
         timestamp_label = "Posted:" if "eng" in target_language.lower() or "en" in target_language.lower() else ("投稿日時:" if "jap" in target_language.lower() or "ja" in target_language.lower() else "게시된 시간:")
         prompt = f"""
-당신은 완벽한 IT/블로그 전문 번역가입니다.
-아래 제공된 [원본 마크다운] 문서를 **{target_language}**로 번역해 주세요.
+Translate the following technical blog post into natural, idiomatic **{target_language}** as used by professional software engineers (e.g., Qiita/Zenn style for Japanese, Hacker News style for English).
 
-[요구사항]
-1. 최상단의 Frontmatter(yaml 형식) 블록에서 `title`과 `description`의 값은 해당 언어로 번역하고 **반드시 큰따옴표("")**로 묶어주세요. (`date`와 `tags`는 원본과 동일하게 유지)
-2. `---` 프론트매터 바로 다음 줄에 나오는 `# [제목]` 헤딩도 자연스러운 **{target_language}**로 번역하세요.
-3. 마크다운의 구조(코드 블록, 인용구, 링크, 볼드체 등)는 절대 훼손하지 마세요.
-4. 글 하단의 타임스탬프 문구인 `*게시된 시간: YYYY-MM-DD HH:mm:ss*`는 **`*{timestamp_label} YYYY-MM-DD HH:mm:ss*`** 형식으로 정합성을 맞추어 번역하세요.
-5. 글의 내용과 맥락을 가장 자연스럽고 매끄러운 {target_language}로 번역하세요.
-6. 오직 번역된 마크다운 결과물만 출력하세요. (설명이나 인사말 금지)
+[Strict Rules]
+1. Preserve all Frontmatter YAML structure (`title` and `description` translated inside quotes, `date` and `tags` unchanged).
+2. Preserve all VitePress markdown containers (`::: tip`, `::: warning`, `::: info` etc.) and code blocks exactly.
+3. Keep technical terminology natural in {target_language} (e.g., avoid stiff literal translations).
+4. Output ONLY the translated markdown without greetings or code block fences surrounding the entire text.
+5. Translate the final timestamp line to `*{timestamp_label} YYYY-MM-DD HH:mm:ss*`.
 
-[원본 마크다운]
+[Source Markdown]
 {markdown_text}
 """
         response = self._generate_content_with_tracking(prompt, model=self.trans_model)

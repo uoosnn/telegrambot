@@ -101,9 +101,12 @@ async def handle_start_cmd(bot: Bot, chat_id: int):
         "매일 아침 9시에 핫이슈 뉴스와 게임 뉴스를 전달해 드립니다.\n\n"
         "**명령어 안내**\n"
         "/reset - 대화 내용을 초기화하고 새 대화를 시작합니다.\n"
-        "/post [제목] - 지금까지의 1:1 대화를 바탕으로 블로그 포스트를 올립니다.\n"
-        "/techpost [제목] - 기술 블로그(tech)에 포스팅합니다.\n"
-        "/write - 마크다운을 직접 입력하여 포스팅\n"
+        "/post [제목] - 대화를 블로그(blog)에 포스팅\n"
+        "/techpost [제목] - 기술 블로그(tech)에 포스팅\n"
+        "/draft [제목/내용] - 검색엔진/목록에 숨겨진 초안(draft: true)으로 저장\n"
+        "/unpublish [키워드] - 기존 발행 글을 비공개(초안)로 전환\n"
+        "/delete [키워드] - 기존 글을 3개 언어(KO/EN/JA)에서 영구 삭제\n"
+        "/write - 마크다운 직접 입력 포스팅\n"
         "/usage - API 토큰 사용량 확인\n"
         "/info - 전체 명령어 목록\n"
         "*(뉴스를 블로그에 올리려면 봇이 보낸 뉴스 메시지에 답장(Reply)하세요)*"
@@ -135,15 +138,74 @@ async def handle_info_cmd(bot: Bot, chat_id: int):
         "📋 **사용 가능한 명령어 목록 (서버리스)**\n\n"
         "/start - 봇 시작 및 초기화\n"
         "/reset - 대화 내용 초기화 (새 대화 시작)\n"
-        "/new - /reset과 동일\n"
         "/post [제목] - 대화 내용을 블로그(blog)에 포스팅\n"
         "/techpost [제목] - 대화 내용을 기술 블로그(tech)에 포스팅\n"
-        "/write - 마크다운을 직접 입력하여 포스팅\n"
+        "/draft [제목] - 검색엔진에 노출되지 않는 비공개 초안(draft: true)으로 저장\n"
+        "/unpublish [키워드] - 기존 발행된 글을 비공개(초안)로 전환\n"
+        "/delete [키워드] - 글을 3개 국어(KO/EN/JA)에서 영구 삭제\n"
+        "/write - 마크다운 직접 입력 포스팅\n"
         "/usage - API 사용량 및 예상 요금 확인\n"
         "/info - 이 명령어 목록 표시\n\n"
         "💡 *봇이 보낸 뉴스에 답장(Reply)하면 AI가 게시글을 작성하고 확인을 요청합니다.*"
     )
     await bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
+
+async def handle_draft_cmd(bot: Bot, chat_id: int, title_arg: str):
+    title_instruction = title_arg.strip() if title_arg else None
+    if not title_instruction:
+        try:
+            title_instruction = await asyncio.to_thread(ai_processor.generate_title_from_history, chat_id)
+        except Exception:
+            title_instruction = f"초안 노트 ({datetime.now().strftime('%Y-%m-%d')})"
+
+    await bot.send_message(chat_id=chat_id, text=f"📝 검색엔진 및 목록에서 제외되는 비공개 초안(draft: true)으로 저장 중입니다... (제목: {title_instruction})")
+    try:
+        markdown_content = await asyncio.to_thread(ai_processor.generate_blog_post_from_history, title_instruction, chat_id)
+        success, result = await asyncio.to_thread(
+            github_uploader.save_and_push_draft,
+            markdown_content,
+            title=title_instruction,
+            folder_name="blog"
+        )
+        if success:
+            await bot.send_message(chat_id=chat_id, text=f"✅ 비공개 초안 저장 성공!\n\n저장 경로: {result}\n*(※ draft: true가 설정되어 사이트 목록 및 Google 검색엔진 색인에서 자동 제외됩니다)*")
+        else:
+            await bot.send_message(chat_id=chat_id, text=f"❌ 깃허브 업로드 실패:\n{result}")
+    except Exception as e:
+        logger.error(f"Error in handle_draft_cmd: {e}", exc_info=True)
+        await bot.send_message(chat_id=chat_id, text=f"❌ 오류 발생: {str(e)}")
+
+async def handle_unpublish_cmd(bot: Bot, chat_id: int, keyword: str):
+    if not keyword.strip():
+        await bot.send_message(chat_id=chat_id, text="❌ 비공개로 전환할 글 제목이나 키워드를 입력해 주세요.\n예: `/unpublish AWS 백업`")
+        return
+
+    await bot.send_message(chat_id=chat_id, text=f"⏳ '{keyword}' 글을 검색하여 비공개(draft: true)로 전환 중입니다...")
+    try:
+        success, result = await asyncio.to_thread(github_uploader.unpublish_post, keyword.strip())
+        if success:
+            await bot.send_message(chat_id=chat_id, text=f"✅ {result}\n*(※ 사이트 목록에서 숨겨지고 Google noindex가 적용됩니다)*")
+        else:
+            await bot.send_message(chat_id=chat_id, text=f"⚠️ {result}")
+    except Exception as e:
+        logger.error(f"Error in handle_unpublish_cmd: {e}", exc_info=True)
+        await bot.send_message(chat_id=chat_id, text=f"❌ 오류 발생: {str(e)}")
+
+async def handle_delete_cmd(bot: Bot, chat_id: int, keyword: str):
+    if not keyword.strip():
+        await bot.send_message(chat_id=chat_id, text="❌ 삭제할 글 제목이나 키워드를 입력해 주세요.\n예: `/delete 삭제할글제목`")
+        return
+
+    await bot.send_message(chat_id=chat_id, text=f"⏳ '{keyword}' 글을 3개 언어에서 영구 삭제 중입니다...")
+    try:
+        success, result = await asyncio.to_thread(github_uploader.delete_post, keyword.strip())
+        if success:
+            await bot.send_message(chat_id=chat_id, text=f"✅ {result}")
+        else:
+            await bot.send_message(chat_id=chat_id, text=f"⚠️ {result}")
+    except Exception as e:
+        logger.error(f"Error in handle_delete_cmd: {e}", exc_info=True)
+        await bot.send_message(chat_id=chat_id, text=f"❌ 오류 발생: {str(e)}")
 
 async def handle_post_cmd(bot: Bot, chat_id: int, title_arg: str, folder_name="blog"):
     target_name = "기술 블로그(tech)" if folder_name == "tech" else "블로그(blog)"
@@ -376,6 +438,12 @@ async def dispatch_telegram_update(bot: Bot, update_data: dict):
             await handle_post_cmd(bot, chat_id, args, folder_name="blog")
         elif cmd in ["/techpost"]:
             await handle_post_cmd(bot, chat_id, args, folder_name="tech")
+        elif cmd in ["/draft"]:
+            await handle_draft_cmd(bot, chat_id, args)
+        elif cmd in ["/unpublish"]:
+            await handle_unpublish_cmd(bot, chat_id, args)
+        elif cmd in ["/delete"]:
+            await handle_delete_cmd(bot, chat_id, args)
         elif cmd in ["/write"]:
             await handle_write_cmd(bot, chat_id, args)
         return
