@@ -4,6 +4,7 @@ import base64
 import logging
 import asyncio
 import uuid
+import hashlib
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -29,6 +30,105 @@ dynamo_mgr = DynamoManager()
 ai_processor = AIProcessor(dynamo_mgr=dynamo_mgr)
 github_uploader = GithubUploader()
 news_scraper = NewsScraper()
+
+POSTS_PER_PAGE = 8
+
+
+# --- Helper: Token ID & Post Management UI ---
+
+def make_post_token(folder: str, filename: str) -> str:
+    raw = f"{folder}/{filename}".encode("utf-8")
+    token_id = hashlib.md5(raw).hexdigest()[:10]
+    dynamo_mgr.save_delete_target(token_id, folder, filename)
+    return token_id
+
+
+def resolve_post_token(token_id: str):
+    target = dynamo_mgr.get_delete_target(token_id)
+    if target and target.get("folder") and target.get("filename"):
+        return target["folder"], target["filename"]
+
+    # Fallback: DynamoDB TTL 만료 시 저장소 파일 목록에서 해시 매칭으로 복원
+    all_posts = github_uploader.list_all_posts()
+    for folder, filename in all_posts:
+        raw = f"{folder}/{filename}".encode("utf-8")
+        if hashlib.md5(raw).hexdigest()[:10] == token_id:
+            dynamo_mgr.save_delete_target(token_id, folder, filename)
+            return folder, filename
+    return None, None
+
+
+def build_post_Complete_markup(folder: str, filename: str) -> InlineKeyboardMarkup:
+    token_id = make_post_token(folder, filename)
+    keyboard = [
+        [
+            InlineKeyboardButton("🗑️ 방금 올린 글 삭제", callback_data=f"del_sel_{token_id}"),
+            InlineKeyboardButton("🙈 비공개 전환", callback_data=f"unpub_exec_{token_id}")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_post_confirm_view(folder: str, filename: str):
+    token_id = make_post_token(folder, filename)
+    badge = "🛠️ Tech" if folder == "tech" else "📝 Blog"
+    display_title = filename[:-3] if filename.endswith(".md") else filename
+    text = (
+        f"📌 **게시글 관리 선택**\n\n"
+        f"• **분류:** {badge} (`{folder}`)\n"
+        f"• **제목:** {display_title}\n"
+        f"• **파일:** `{filename}`\n\n"
+        f"⚠️ **영구 삭제** 시 3개 국어(KO/EN/JA) 파일, 기술 색인(`tech/index.md`), 본문 내 첨부 이미지가 **단 1번의 커밋**으로 모두 삭제됩니다."
+    )
+    keyboard = [
+        [
+            InlineKeyboardButton("🗑️ 영구 삭제 (KO/EN/JA)", callback_data=f"del_exec_{token_id}"),
+            InlineKeyboardButton("🙈 비공개 전환 (draft)", callback_data=f"unpub_exec_{token_id}")
+        ],
+        [
+            InlineKeyboardButton("📋 전체 목록 보기", callback_data="del_page_0"),
+            InlineKeyboardButton("❌ 취소", callback_data="del_close")
+        ]
+    ]
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+def build_post_list_view(posts: list, page: int = 0, header_text: str = None):
+    total = len(posts)
+    total_pages = max(1, (total + POSTS_PER_PAGE - 1) // POSTS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+
+    start_idx = page * POSTS_PER_PAGE
+    page_items = posts[start_idx:start_idx + POSTS_PER_PAGE]
+
+    keyboard = []
+    for folder, filename in page_items:
+        token_id = make_post_token(folder, filename)
+        icon = "🛠️" if folder == "tech" else "📝"
+        clean_name = filename[:-3] if filename.endswith(".md") else filename
+        if len(clean_name) > 28:
+            clean_name = clean_name[:27] + "…"
+        keyboard.append([
+            InlineKeyboardButton(f"{icon} [{folder}] {clean_name}", callback_data=f"del_sel_{token_id}")
+        ])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("◀️ 이전", callback_data=f"del_page_{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("다음 ▶️", callback_data=f"del_page_{page + 1}"))
+    if nav_row:
+        keyboard.append(nav_row)
+
+    keyboard.append([InlineKeyboardButton("❌ 닫기", callback_data="del_close")])
+
+    if not header_text:
+        header_text = (
+            f"🗑️ **삭제 또는 비공개할 게시글을 선택하세요**\n"
+            f"*(총 {total}개 게시글 | 페이지 {page + 1}/{total_pages})*\n\n"
+            f"💡 최근에 올린 글이 상단에 표시됩니다. 버튼을 누르면 확인 창으로 이동합니다."
+        )
+    return header_text, InlineKeyboardMarkup(keyboard)
 
 
 # --- Helper: Split Message Sending ---
@@ -104,8 +204,8 @@ async def handle_start_cmd(bot: Bot, chat_id: int):
         "/post [제목] - 대화를 블로그(blog)에 포스팅\n"
         "/techpost [제목] - 기술 블로그(tech)에 포스팅\n"
         "/draft [제목/내용] - 검색엔진/목록에 숨겨진 초안(draft: true)으로 저장\n"
-        "/unpublish [키워드] - 기존 발행 글을 비공개(초안)로 전환\n"
-        "/delete [키워드] - 기존 글을 3개 언어(KO/EN/JA)에서 영구 삭제\n"
+        "/delete [키워드(생략가능)] - 버튼으로 간편하게 게시글 영구 삭제 및 비공개 전환\n"
+        "/unpublish [키워드(생략가능)] - 기존 발행 글을 비공개(초안)로 전환\n"
         "/write - 마크다운 직접 입력 포스팅\n"
         "/usage - API 토큰 사용량 확인\n"
         "/info - 전체 명령어 목록\n"
@@ -141,12 +241,12 @@ async def handle_info_cmd(bot: Bot, chat_id: int):
         "/post [제목] - 대화 내용을 블로그(blog)에 포스팅\n"
         "/techpost [제목] - 대화 내용을 기술 블로그(tech)에 포스팅\n"
         "/draft [제목] - 검색엔진에 노출되지 않는 비공개 초안(draft: true)으로 저장\n"
-        "/unpublish [키워드] - 기존 발행된 글을 비공개(초안)로 전환\n"
-        "/delete [키워드] - 글을 3개 국어(KO/EN/JA)에서 영구 삭제\n"
+        "/delete [키워드(생략가능)] - 최근 글 목록 또는 검색 결과에서 클릭하여 삭제/비공개\n"
+        "/unpublish [키워드(생략가능)] - 기존 발행된 글을 비공개(초안)로 전환\n"
         "/write - 마크다운 직접 입력 포스팅\n"
         "/usage - API 사용량 및 예상 요금 확인\n"
         "/info - 이 명령어 목록 표시\n\n"
-        "💡 *봇이 보낸 뉴스에 답장(Reply)하면 AI가 게시글을 작성하고 확인을 요청합니다.*"
+        "💡 *키워드 없이 `/delete`만 입력하면 전체 게시글을 버튼으로 보며 쉽게 삭제할 수 있습니다.*"
     )
     await bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
 
@@ -168,43 +268,69 @@ async def handle_draft_cmd(bot: Bot, chat_id: int, title_arg: str):
             folder_name="blog"
         )
         if success:
-            await bot.send_message(chat_id=chat_id, text=f"✅ 비공개 초안 저장 성공!\n\n저장 경로: {result}\n*(※ draft: true가 설정되어 사이트 목록 및 Google 검색엔진 색인에서 자동 제외됩니다)*")
+            markup = None
+            if github_uploader.last_uploaded:
+                folder, filename = github_uploader.last_uploaded
+                dynamo_mgr.record_recent_post(folder, filename)
+                markup = build_post_Complete_markup(folder, filename)
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"✅ 비공개 초안 저장 성공!\n\n저장 경로: {result}\n*(※ draft: true가 설정되어 사이트 목록 및 Google 검색엔진 색인에서 자동 제외됩니다)*",
+                reply_markup=markup
+            )
         else:
             await bot.send_message(chat_id=chat_id, text=f"❌ 깃허브 업로드 실패:\n{result}")
     except Exception as e:
         logger.error(f"Error in handle_draft_cmd: {e}", exc_info=True)
         await bot.send_message(chat_id=chat_id, text=f"❌ 오류 발생: {str(e)}")
 
-async def handle_unpublish_cmd(bot: Bot, chat_id: int, keyword: str):
-    if not keyword.strip():
-        await bot.send_message(chat_id=chat_id, text="❌ 비공개로 전환할 글 제목이나 키워드를 입력해 주세요.\n예: `/unpublish AWS 백업`")
-        return
-
-    await bot.send_message(chat_id=chat_id, text=f"⏳ '{keyword}' 글을 검색하여 비공개(draft: true)로 전환 중입니다...")
+async def handle_delete_or_unpublish_cmd(bot: Bot, chat_id: int, keyword: str):
+    """
+    /delete 및 /unpublish 통합 대화형 핸들러:
+    - 키워드 미입력 시: 최근 게시글을 포함한 전체 게시글 버튼 목록(페이지네이션 지원) 표시
+    - 키워드 입력 시:
+      - 1건 일치: 즉시 [영구 삭제] / [비공개 전환] 2단계 확인 카드 표시
+      - 다수 일치: 일치하는 게시글들을 인라인 버튼 목록으로 표시하여 재입력 없이 클릭 선택
+    """
+    kw = keyword.strip()
     try:
-        success, result = await asyncio.to_thread(github_uploader.unpublish_post, keyword.strip())
-        if success:
-            await bot.send_message(chat_id=chat_id, text=f"✅ {result}\n*(※ 사이트 목록에서 숨겨지고 Google noindex가 적용됩니다)*")
-        else:
-            await bot.send_message(chat_id=chat_id, text=f"⚠️ {result}")
-    except Exception as e:
-        logger.error(f"Error in handle_unpublish_cmd: {e}", exc_info=True)
-        await bot.send_message(chat_id=chat_id, text=f"❌ 오류 발생: {str(e)}")
+        if not kw:
+            recent_hints = dynamo_mgr.get_recent_posts()
+            all_posts = await asyncio.to_thread(github_uploader.list_all_posts, recent_hints)
+            if not all_posts:
+                await bot.send_message(chat_id=chat_id, text="⚠️ 저장소에서 게시글을 찾을 수 없습니다.")
+                return
+            text, markup = build_post_list_view(all_posts, page=0)
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode='Markdown', reply_markup=markup)
+            return
 
-async def handle_delete_cmd(bot: Bot, chat_id: int, keyword: str):
-    if not keyword.strip():
-        await bot.send_message(chat_id=chat_id, text="❌ 삭제할 글 제목이나 키워드를 입력해 주세요.\n예: `/delete 삭제할글제목`")
-        return
+        matches = await asyncio.to_thread(github_uploader.find_post_files, kw)
+        if not matches:
+            keyboard = [[InlineKeyboardButton("📋 전체 게시글 목록 보기", callback_data="del_page_0")]]
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ '{kw}'에 해당하는 게시글을 찾을 수 없습니다.\n전체 목록에서 직접 선택해 보세요.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
 
-    await bot.send_message(chat_id=chat_id, text=f"⏳ '{keyword}' 글을 3개 언어에서 영구 삭제 중입니다...")
-    try:
-        success, result = await asyncio.to_thread(github_uploader.delete_post, keyword.strip())
-        if success:
-            await bot.send_message(chat_id=chat_id, text=f"✅ {result}")
-        else:
-            await bot.send_message(chat_id=chat_id, text=f"⚠️ {result}")
+        if len(matches) == 1:
+            folder, filename, _ = matches[0]
+            text, markup = build_post_confirm_view(folder, filename)
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode='Markdown', reply_markup=markup)
+            return
+
+        # 복수 매칭 시 버튼 목록으로 제시
+        matched_pairs = [(f, n) for f, n, _ in matches]
+        header = (
+            f"🔍 **'{kw}' 검색 결과 ({len(matched_pairs)}건)**\n\n"
+            f"삭제하거나 비공개로 전환할 게시글을 아래 버튼에서 선택해 주세요:"
+        )
+        text, markup = build_post_list_view(matched_pairs, page=0, header_text=header)
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode='Markdown', reply_markup=markup)
+
     except Exception as e:
-        logger.error(f"Error in handle_delete_cmd: {e}", exc_info=True)
+        logger.error(f"Error in handle_delete_or_unpublish_cmd: {e}", exc_info=True)
         await bot.send_message(chat_id=chat_id, text=f"❌ 오류 발생: {str(e)}")
 
 async def handle_post_cmd(bot: Bot, chat_id: int, title_arg: str, folder_name="blog"):
@@ -240,9 +366,17 @@ async def handle_post_cmd(bot: Bot, chat_id: int, title_arg: str, folder_name="b
             translations={'en': content_en, 'ja': content_ja}
         )
 
-
         if success:
-            await bot.send_message(chat_id=chat_id, text=f"✅ {target_name} 포스팅 성공!\n\n저장 경로: {result}")
+            markup = None
+            if github_uploader.last_uploaded:
+                folder, filename = github_uploader.last_uploaded
+                dynamo_mgr.record_recent_post(folder, filename)
+                markup = build_post_Complete_markup(folder, filename)
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"✅ {target_name} 포스팅 성공! (단일 커밋 완료)\n\n저장 경로: {result}",
+                reply_markup=markup
+            )
         else:
             await bot.send_message(chat_id=chat_id, text=f"❌ 깃허브 업로드 실패:\n{result}")
     except Exception as e:
@@ -261,7 +395,16 @@ async def handle_write_cmd(bot: Bot, chat_id: int, user_text: str):
     try:
         success, result = await asyncio.to_thread(github_uploader.save_and_push, user_text, title=title)
         if success:
-            await bot.send_message(chat_id=chat_id, text=f"✅ 블로그 수동 포스팅 성공!\n\n저장 경로: {result}")
+            markup = None
+            if github_uploader.last_uploaded:
+                folder, filename = github_uploader.last_uploaded
+                dynamo_mgr.record_recent_post(folder, filename)
+                markup = build_post_Complete_markup(folder, filename)
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"✅ 블로그 수동 포스팅 성공!\n\n저장 경로: {result}",
+                reply_markup=markup
+            )
         else:
             await bot.send_message(chat_id=chat_id, text=f"❌ 깃허브 업로드 실패:\n{result}")
     except Exception as e:
@@ -353,6 +496,7 @@ async def handle_callback_query(bot: Bot, callback_query: dict):
     except Exception:
         pass
 
+    # --- A. 뉴스 기반 포스팅 확인/취소 ---
     if data.startswith("confirm_post_"):
         reply_to_id = int(data.replace("confirm_post_", ""))
         confirmation = dynamo_mgr.get_pending_confirmation(reply_to_id)
@@ -376,9 +520,18 @@ async def handle_callback_query(bot: Bot, callback_query: dict):
                 translations={'en': content_en, 'ja': content_ja}
             )
 
-
             if success:
-                await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=f"✅ 뉴스 기반 블로그 포스팅 성공!\n\n저장 경로: {result}")
+                markup = None
+                if github_uploader.last_uploaded:
+                    folder, filename = github_uploader.last_uploaded
+                    dynamo_mgr.record_recent_post(folder, filename)
+                    markup = build_post_Complete_markup(folder, filename)
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    text=f"✅ 뉴스 기반 블로그 포스팅 성공! (단일 커밋 완료)\n\n저장 경로: {result}",
+                    reply_markup=markup
+                )
                 dynamo_mgr.delete_pending_confirmation(reply_to_id)
                 dynamo_mgr.delete_pending_message(reply_to_id)
             else:
@@ -391,6 +544,79 @@ async def handle_callback_query(bot: Bot, callback_query: dict):
         reply_to_id = int(data.replace("cancel_post_", ""))
         dynamo_mgr.delete_pending_confirmation(reply_to_id)
         await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text="❌ 게시가 취소되었습니다.")
+
+    # --- B. 게시글 간편 삭제 및 비공개 관리 콜백 ---
+    elif data == "del_close":
+        await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text="✅ 게시글 관리 창을 닫았습니다.")
+
+    elif data.startswith("del_page_"):
+        page = int(data.replace("del_page_", ""))
+        recent_hints = dynamo_mgr.get_recent_posts()
+        all_posts = await asyncio.to_thread(github_uploader.list_all_posts, recent_hints)
+        if not all_posts:
+            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text="⚠️ 저장소에서 게시글을 찾을 수 없습니다.")
+            return
+        text, markup = build_post_list_view(all_posts, page=page)
+        await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, parse_mode='Markdown', reply_markup=markup)
+
+    elif data.startswith("del_sel_"):
+        token_id = data.replace("del_sel_", "")
+        folder, filename = await asyncio.to_thread(resolve_post_token, token_id)
+        if not folder or not filename:
+            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text="⚠️ 선택한 게시글 정보를 찾을 수 없거나 이미 삭제되었습니다.")
+            return
+        text, markup = build_post_confirm_view(folder, filename)
+        await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, parse_mode='Markdown', reply_markup=markup)
+
+    elif data.startswith("del_exec_"):
+        token_id = data.replace("del_exec_", "")
+        folder, filename = await asyncio.to_thread(resolve_post_token, token_id)
+        if not folder or not filename:
+            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text="⚠️ 삭제할 게시글 정보를 찾을 수 없거나 이미 삭제되었습니다.")
+            return
+
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg_id,
+            text=f"⏳ `[{folder}] {filename}` 게시글(KO/EN/JA), 색인 및 첨부 이미지를 단일 커밋으로 영구 삭제 중입니다..."
+        )
+        try:
+            success, result = await asyncio.to_thread(github_uploader.delete_post_by_target, folder, filename)
+            if success:
+                dynamo_mgr.remove_recent_post(folder, filename)
+                dynamo_mgr.delete_delete_target(token_id)
+                await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=f"✅ {result}")
+            else:
+                await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=f"⚠️ {result}")
+        except Exception as e:
+            logger.error(f"Error in del_exec callback: {e}", exc_info=True)
+            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=f"❌ 삭제 중 오류 발생: {str(e)}")
+
+    elif data.startswith("unpub_exec_"):
+        token_id = data.replace("unpub_exec_", "")
+        folder, filename = await asyncio.to_thread(resolve_post_token, token_id)
+        if not folder or not filename:
+            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text="⚠️ 비공개 전환할 게시글 정보를 찾을 수 없습니다.")
+            return
+
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg_id,
+            text=f"⏳ `[{folder}] {filename}` 게시글을 비공개(draft: true)로 전환 중입니다..."
+        )
+        try:
+            success, result = await asyncio.to_thread(github_uploader.unpublish_post_by_target, folder, filename)
+            if success:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    text=f"✅ {result}\n*(※ 사이트 목록 및 검색엔진 색인에서 제외됩니다)*"
+                )
+            else:
+                await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=f"⚠️ {result}")
+        except Exception as e:
+            logger.error(f"Error in unpub_exec callback: {e}", exc_info=True)
+            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=f"❌ 비공개 전환 중 오류 발생: {str(e)}")
 
 
 # --- 3. Unified Update Dispatcher ---
@@ -440,10 +666,8 @@ async def dispatch_telegram_update(bot: Bot, update_data: dict):
             await handle_post_cmd(bot, chat_id, args, folder_name="tech")
         elif cmd in ["/draft"]:
             await handle_draft_cmd(bot, chat_id, args)
-        elif cmd in ["/unpublish"]:
-            await handle_unpublish_cmd(bot, chat_id, args)
-        elif cmd in ["/delete"]:
-            await handle_delete_cmd(bot, chat_id, args)
+        elif cmd in ["/delete", "/unpublish", "/manage", "/posts"]:
+            await handle_delete_or_unpublish_cmd(bot, chat_id, args)
         elif cmd in ["/write"]:
             await handle_write_cmd(bot, chat_id, args)
         return
@@ -505,4 +729,3 @@ async def _async_lambda_handler(event, context):
 
 def lambda_handler(event, context):
     return asyncio.run(_async_lambda_handler(event, context))
-

@@ -14,6 +14,7 @@ AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
 class DynamoManager:
     def __init__(self, table_name=None):
         self.table_name = table_name or TABLE_NAME
+        self._local_targets = {}
         try:
             self.dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
             self.table = self.dynamodb.Table(self.table_name)
@@ -205,3 +206,96 @@ class DynamoManager:
             self.table.delete_item(Key={"PK": "CHAT_HISTORY", "SK": str(chat_id)})
         except Exception as e:
             logger.error(f"Error clearing chat history: {e}")
+
+    # 6. Post Delete/Unpublish Target Mapping (Inline Keyboard Callback Token)
+    def save_delete_target(self, token_id: str, folder: str, filename: str):
+        target_data = {"folder": folder, "filename": filename}
+        self._local_targets[token_id] = target_data
+        if not self.table:
+            return
+        try:
+            self.table.put_item(
+                Item={
+                    "PK": "DEL_TARGET",
+                    "SK": str(token_id),
+                    "folder": folder,
+                    "filename": filename,
+                    "created_at": int(time.time()),
+                    "ttl": int(time.time()) + (2 * 86400) # 2일 후 자동 만료
+                }
+            )
+        except Exception as e:
+            logger.error(f"Error saving delete target: {e}")
+
+    def get_delete_target(self, token_id: str) -> dict:
+        if token_id in self._local_targets:
+            return self._local_targets[token_id]
+        if not self.table:
+            return None
+        try:
+            response = self.table.get_item(Key={"PK": "DEL_TARGET", "SK": str(token_id)})
+            if "Item" in response:
+                return {
+                    "folder": response["Item"].get("folder"),
+                    "filename": response["Item"].get("filename")
+                }
+        except Exception as e:
+            logger.error(f"Error getting delete target: {e}")
+        return None
+
+    def delete_delete_target(self, token_id: str):
+        self._local_targets.pop(token_id, None)
+        if not self.table:
+            return
+        try:
+            self.table.delete_item(Key={"PK": "DEL_TARGET", "SK": str(token_id)})
+        except Exception as e:
+            logger.error(f"Error deleting delete target: {e}")
+
+    def record_recent_post(self, folder: str, filename: str):
+        if not self.table:
+            return
+        try:
+            existing = self.get_recent_posts()
+            entry = {"folder": folder, "filename": filename}
+            filtered = [p for p in existing if not (p.get("folder") == folder and p.get("filename") == filename)]
+            updated = ([entry] + filtered)[:30]
+            self.table.put_item(
+                Item={
+                    "PK": "RECENT_POSTS",
+                    "SK": "LIST",
+                    "posts": updated,
+                    "updated_at": int(time.time())
+                }
+            )
+        except Exception as e:
+            logger.error(f"Error recording recent post: {e}")
+
+    def get_recent_posts(self) -> list:
+        if not self.table:
+            return []
+        try:
+            response = self.table.get_item(Key={"PK": "RECENT_POSTS", "SK": "LIST"})
+            if "Item" in response:
+                return response["Item"].get("posts", [])
+        except Exception as e:
+            logger.error(f"Error getting recent posts: {e}")
+        return []
+
+    def remove_recent_post(self, folder: str, filename: str):
+        if not self.table:
+            return
+        try:
+            existing = self.get_recent_posts()
+            updated = [p for p in existing if not (p.get("folder") == folder and p.get("filename") == filename)]
+            if len(updated) != len(existing):
+                self.table.put_item(
+                    Item={
+                        "PK": "RECENT_POSTS",
+                        "SK": "LIST",
+                        "posts": updated,
+                        "updated_at": int(time.time())
+                    }
+                )
+        except Exception as e:
+            logger.error(f"Error removing recent post: {e}")

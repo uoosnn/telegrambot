@@ -2,7 +2,7 @@ import os
 import re
 import logging
 import urllib.parse
-from github import Github, GithubException, Auth
+from github import Github, GithubException, Auth, InputGitTreeElement
 
 logger = logging.getLogger(__name__)
 
@@ -11,6 +11,7 @@ class GithubUploader:
         self.token = token or os.getenv("GITHUB_TOKEN")
         self.repo_name = repo_name or os.getenv("TARGET_REPO", "uoosnn/uoosnn.github.io")
         self.branch = os.getenv("TARGET_BRANCH", "main")
+        self.last_uploaded = None
         
         if not self.token:
             logger.warning("GITHUB_TOKEN is not set.")
@@ -121,13 +122,31 @@ class GithubUploader:
         updated_content = index_content[:insert_at] + new_row + index_content[insert_at:]
         return updated_content
 
-    def _update_tech_index(self, filename, ko_content, translations=None):
-        """tech/index.md 및 다국어 인덱스 파일에 신규 포스트 행 자동 삽입"""
+    def _remove_row_from_index(self, index_content: str, filename: str) -> str:
+        """index.md 테이블에서 삭제/비공개된 파일명 링크가 포함된 행을 제거"""
+        encoded_link = f"./{urllib.parse.quote(filename)}"
+        raw_link = f"./{filename}"
+        lines = index_content.splitlines()
+        filtered_lines = [
+            line for line in lines
+            if not (
+                line.strip().startswith("|")
+                and (encoded_link in line or raw_link in line or f"({filename})" in line)
+            )
+        ]
+        res = "\n".join(filtered_lines)
+        if index_content.endswith("\n") and not res.endswith("\n"):
+            res += "\n"
+        return res
+
+    def _prepare_tech_index_updates(self, filename, ko_content, translations=None) -> dict:
+        """tech/index.md 및 다국어 인덱스 파일의 업데이트 본문을 딕셔너리로 반환"""
+        index_updates = {}
         try:
             ko_meta = self._extract_frontmatter_info(ko_content)
             category_num = self._determine_tech_category(ko_meta.get("tags", []), ko_meta.get("title", ""))
-            
-            # 1. 한국어 tech/index.md 업데이트
+
+            # 1. 한국어 tech/index.md
             try:
                 ko_index_file = self.repo.get_contents("tech/index.md", ref=self.branch)
                 ko_index_content = ko_index_file.decoded_content.decode('utf-8')
@@ -140,11 +159,11 @@ class GithubUploader:
                     ko_meta.get("date", "")
                 )
                 if updated_ko_index != ko_index_content:
-                    self._commit_or_update_file("tech/index.md", updated_ko_index, f"docs: Update tech/index.md for {filename}")
+                    index_updates["tech/index.md"] = updated_ko_index
             except Exception as e:
-                logger.warning(f"Failed to update tech/index.md: {e}")
+                logger.warning(f"Failed to read/prepare tech/index.md: {e}")
 
-            # 2. 영문 en/tech/index.md 업데이트
+            # 2. 영문 en/tech/index.md
             if translations and "en" in translations:
                 en_meta = self._extract_frontmatter_info(translations["en"])
                 try:
@@ -159,11 +178,11 @@ class GithubUploader:
                         ko_meta.get("date", "")
                     )
                     if updated_en_index != en_index_content:
-                        self._commit_or_update_file("en/tech/index.md", updated_en_index, f"docs: Update en/tech/index.md for {filename}")
+                        index_updates["en/tech/index.md"] = updated_en_index
                 except Exception as ee:
-                    logger.warning(f"Failed to update en/tech/index.md: {ee}")
+                    logger.warning(f"Failed to read/prepare en/tech/index.md: {ee}")
 
-            # 3. 일문 ja/tech/index.md 업데이트
+            # 3. 일문 ja/tech/index.md
             if translations and "ja" in translations:
                 ja_meta = self._extract_frontmatter_info(translations["ja"])
                 try:
@@ -178,20 +197,50 @@ class GithubUploader:
                         ko_meta.get("date", "")
                     )
                     if updated_ja_index != ja_index_content:
-                        self._commit_or_update_file("ja/tech/index.md", updated_ja_index, f"docs: Update ja/tech/index.md for {filename}")
+                        index_updates["ja/tech/index.md"] = updated_ja_index
                 except Exception as je:
-                    logger.warning(f"Failed to update ja/tech/index.md: {je}")
+                    logger.warning(f"Failed to read/prepare ja/tech/index.md: {je}")
 
         except Exception as e:
-            logger.error(f"Error in _update_tech_index: {e}", exc_info=True)
+            logger.error(f"Error in _prepare_tech_index_updates: {e}", exc_info=True)
+        return index_updates
+
+    def _prepare_tech_index_removals(self, filename: str) -> dict:
+        """tech/index.md (KO/EN/JA)에서 삭제/비공개된 포스트 행을 제거한 본문 딕셔너리 반환"""
+        index_updates = {}
+        for index_path in ["tech/index.md", "en/tech/index.md", "ja/tech/index.md"]:
+            try:
+                idx_file = self.repo.get_contents(index_path, ref=self.branch)
+                idx_content = idx_file.decoded_content.decode("utf-8")
+                updated_content = self._remove_row_from_index(idx_content, filename)
+                if updated_content != idx_content:
+                    index_updates[index_path] = updated_content
+            except Exception as e:
+                logger.warning(f"Failed to prepare index removal for {index_path}: {e}")
+        return index_updates
+
+    def _update_tech_index(self, filename, ko_content, translations=None):
+        """tech/index.md 및 다국어 인덱스 파일에 신규 포스트 행 자동 삽입 (개별 호출 하위 호환용)"""
+        updates = self._prepare_tech_index_updates(filename, ko_content, translations=translations)
+        for path, content in updates.items():
+            try:
+                self._commit_or_update_file(path, content, f"docs: Update {path} for {filename}")
+            except Exception as e:
+                logger.warning(f"Failed to update {path}: {e}")
+
+    def _extract_image_paths(self, markdown_text: str) -> list:
+        """마크다운 본문에서 /images/img_... 경로 추출"""
+        if not markdown_text:
+            return []
+        matches = re.findall(r'\(/images/([^)\s"\']+)', markdown_text)
+        return list(dict.fromkeys([f"public/images/{m}" for m in matches if m]))
 
     def _commit_or_update_file(self, path, content, commit_message):
-        """GitHub REST API로 파일 생성 또는 업데이트"""
+        """GitHub REST API로 단일 파일 생성 또는 업데이트"""
         if not self.repo:
             raise Exception("GitHub repository is not configured.")
             
         try:
-            # 기존 파일 확인
             try:
                 existing = self.repo.get_contents(path, ref=self.branch)
                 self.repo.update_file(
@@ -218,6 +267,66 @@ class GithubUploader:
             logger.error(f"Error committing file {path} to GitHub: {e}")
             raise e
 
+    def _commit_multiple_changes(self, updates: dict, deletes: list, commit_message: str):
+        """
+        Git Tree API를 사용하여 여러 파일의 생성/수정(updates) 및 삭제(deletes)를
+        단 1번의 원자적 커밋(Single Atomic Commit)으로 반영합니다.
+        """
+        if not self.repo:
+            raise Exception("GitHub repository is not configured.")
+        if not updates and not deletes:
+            return False
+
+        try:
+            ref = self.repo.get_git_ref(f"heads/{self.branch}")
+            latest_commit_sha = ref.object.sha
+            base_commit = self.repo.get_git_commit(latest_commit_sha)
+            base_tree = base_commit.tree
+
+            tree_elements = []
+            for path, content in (updates or {}).items():
+                tree_elements.append(
+                    InputGitTreeElement(
+                        path=path,
+                        mode="100644",
+                        type="blob",
+                        content=content
+                    )
+                )
+
+            for path in (deletes or []):
+                tree_elements.append(
+                    InputGitTreeElement(
+                        path=path,
+                        mode="100644",
+                        type="blob",
+                        sha=None
+                    )
+                )
+
+            new_tree = self.repo.create_git_tree(tree_elements, base_tree=base_tree)
+            new_commit = self.repo.create_git_commit(commit_message, new_tree, [base_commit])
+            ref.edit(new_commit.sha)
+            logger.info(f"Committed {len(updates or {})} updates and {len(deletes or [])} deletes in single commit: {new_commit.sha}")
+            return True
+        except Exception as e:
+            logger.warning(f"Git Tree atomic commit failed ({e}), falling back to sequential API calls...")
+            # Fallback: 개별 API 호출
+            for path, content in (updates or {}).items():
+                self._commit_or_update_file(path, content, commit_message)
+            for path in (deletes or []):
+                try:
+                    file_obj = self.repo.get_contents(path, ref=self.branch)
+                    self.repo.delete_file(
+                        path=path,
+                        message=commit_message,
+                        sha=file_obj.sha,
+                        branch=self.branch
+                    )
+                except Exception as de:
+                    logger.warning(f"Fallback delete failed for {path}: {de}")
+            return True
+
     def save_and_push(self, markdown_content, title=None, folder_name="blog", translations=None):
         if not self.repo:
             return False, "GitHub repository connection not configured (check GITHUB_TOKEN)."
@@ -231,24 +340,27 @@ class GithubUploader:
         formatted_ko = self._format_markdown_for_lang(markdown_content, lang="ko")
 
         try:
-            # 1. 한국어 원본 커밋
-            commit_msg = f"docs: Auto post from Telegram Bot ({title})"
-            self._commit_or_update_file(filepath, formatted_ko, commit_msg)
+            updates = {filepath: formatted_ko}
             uploaded_paths = [filepath]
 
-            # 2. 다국어 번역본 커밋
+            # 다국어 번역본 준비
             if translations:
                 for lang, trans_content in translations.items():
                     lang_path = f"{lang}/{folder_name}/{filename}"
                     formatted_trans = self._format_markdown_for_lang(trans_content, lang=lang)
-                    trans_commit_msg = f"docs: Auto translate {lang} ({title})"
-                    self._commit_or_update_file(lang_path, formatted_trans, trans_commit_msg)
+                    updates[lang_path] = formatted_trans
                     uploaded_paths.append(lang_path)
 
-            # 3. tech 포스트인 경우 index.md (KO/EN/JA) 자동 업데이트
+            # tech 포스트인 경우 index.md (KO/EN/JA) 업데이트 준비
             if folder_name == "tech":
-                self._update_tech_index(filename, formatted_ko, translations=translations)
-                uploaded_paths.append("tech/index.md (자동 색인)")
+                index_updates = self._prepare_tech_index_updates(filename, formatted_ko, translations=translations)
+                if index_updates:
+                    updates.update(index_updates)
+                    uploaded_paths.append("tech/index.md (자동 색인)")
+
+            commit_msg = f"docs: Auto post from Telegram Bot ({title})"
+            self._commit_multiple_changes(updates=updates, deletes=[], commit_message=commit_msg)
+            self.last_uploaded = (folder_name, filename)
 
             return True, f"GitHub ({', '.join(uploaded_paths)})"
         except Exception as e:
@@ -262,7 +374,7 @@ class GithubUploader:
         commit_msg = f"docs: Upload image {filename}"
 
         try:
-            self._commit_or_update_file(filepath, file_bytes, commit_msg)
+            self._commit_or_update_file(filepath, bytes(file_bytes), commit_msg)
             return True, f"![이미지](/images/{filename})"
         except Exception as e:
             return False, str(e)
@@ -278,35 +390,62 @@ class GithubUploader:
                 markdown_content = f"---\ndraft: true\n---\n\n{markdown_content}"
         return self.save_and_push(markdown_content, title=title, folder_name=folder_name, translations=None)
 
+    def list_all_posts(self, recent_hints: list = None) -> list:
+        """
+        저장소의 tech/ 및 blog/ 폴더에 있는 모든 게시글 목록을 (folder, filename) 튜플 리스트로 반환합니다.
+        recent_hints(최근 작성 이력)가 있으면 해당 글을 최상단에 배치합니다.
+        """
+        if not self.repo:
+            return []
+        all_posts = []
+        for folder in ["tech", "blog"]:
+            try:
+                contents = self.repo.get_contents(folder, ref=self.branch)
+                folder_items = [
+                    (folder, item.name)
+                    for item in contents
+                    if item.name.endswith(".md") and item.name != "index.md"
+                ]
+                folder_items.sort(key=lambda x: x[1], reverse=True)
+                all_posts.extend(folder_items)
+            except Exception as e:
+                logger.warning(f"Error listing {folder}: {e}")
+
+        if recent_hints:
+            existing_set = set(all_posts)
+            prioritized = []
+            for h in recent_hints:
+                pair = (h.get("folder"), h.get("filename"))
+                if pair in existing_set and pair not in prioritized:
+                    prioritized.append(pair)
+            remainder = [p for p in all_posts if p not in prioritized]
+            return prioritized + remainder
+
+        return all_posts
+
     def find_post_files(self, keyword):
         """키워드나 파일명으로 블로그 포스트 파일 검색"""
         if not self.repo:
             return []
         found = []
+        kw = keyword.strip().lower()
         for folder in ["tech", "blog"]:
             try:
                 contents = self.repo.get_contents(folder, ref=self.branch)
                 for item in contents:
                     if item.name.endswith(".md") and item.name != "index.md":
-                        if keyword.lower() in item.name.lower():
+                        if not kw or kw in item.name.lower():
                             found.append((folder, item.name, item.sha))
             except Exception:
                 pass
         return found
 
-    def unpublish_post(self, keyword):
-        """게시글의 frontmatter에 draft: true를 추가하여 비공개/색인제외 전환"""
+    def unpublish_post_by_target(self, folder: str, filename: str):
+        """특정 (folder, filename) 게시글의 frontmatter에 draft: true를 추가하고 tech/index.md에서 제외 (단일 커밋)"""
         if not self.repo:
             return False, "GitHub 저장소 미연결"
 
-        matches = self.find_post_files(keyword)
-        if not matches:
-            return False, f"'{keyword}'에 해당하는 게시글을 찾을 수 없습니다."
-        if len(matches) > 1:
-            names = [f"[{f}] {n}" for f, n, _ in matches[:5]]
-            return False, f"일치하는 글이 여러 개 있습니다. 더 정확한 제목을 입력해 주세요:\n" + "\n".join(names)
-
-        folder, filename, _ = matches[0]
+        updates = {}
         updated_paths = []
 
         for prefix in ["", "ja/", "en/"]:
@@ -314,29 +453,101 @@ class GithubUploader:
             try:
                 file_obj = self.repo.get_contents(path, ref=self.branch)
                 content = file_obj.decoded_content.decode("utf-8")
-                if not re.search(r'^draft:\s*', content, re.MULTILINE):
-                    if content.startswith('---'):
+                if not re.search(r'^draft:\s*true', content, re.MULTILINE | re.IGNORECASE):
+                    if re.search(r'^draft:\s*false', content, re.MULTILINE | re.IGNORECASE):
+                        new_content = re.sub(r'^draft:\s*false', 'draft: true', content, flags=re.MULTILINE | re.IGNORECASE)
+                    elif content.startswith('---'):
                         parts = content.split('---', 2)
                         if len(parts) >= 3:
                             new_content = f"---{parts[1]}\ndraft: true\n---{parts[2]}"
+                        else:
+                            new_content = f"---\ndraft: true\n---\n\n{content}"
                     else:
                         new_content = f"---\ndraft: true\n---\n\n{content}"
 
-                    self.repo.update_file(
-                        path=path,
-                        message=f"chore: Unpublish post (draft: true) - {filename}",
-                        content=new_content,
-                        sha=file_obj.sha,
-                        branch=self.branch
-                    )
+                    updates[path] = new_content
                     updated_paths.append(path)
             except Exception as e:
-                logger.warning(f"Failed to unpublish {path}: {e}")
+                logger.warning(f"Failed to read {path} for unpublish: {e}")
 
-        return True, f"비공개(초안) 전환 완료:\n" + "\n".join(updated_paths)
+        if folder == "tech":
+            index_removals = self._prepare_tech_index_removals(filename)
+            if index_removals:
+                updates.update(index_removals)
+                updated_paths.extend(list(index_removals.keys()))
 
-    def delete_post(self, keyword):
-        """게시글을 KO, EN, JA 3개 언어에서 영구 삭제"""
+        if not updates:
+            return False, f"이미 비공개 상태이거나 파일을 찾을 수 없습니다: [{folder}] {filename}"
+
+        try:
+            self._commit_multiple_changes(
+                updates=updates,
+                deletes=[],
+                commit_message=f"chore: Unpublish post (draft: true) - {filename}"
+            )
+            return True, f"비공개(초안) 전환 완료 (단일 커밋):\n" + "\n".join(updated_paths)
+        except Exception as e:
+            return False, f"비공개 전환 중 오류 발생: {e}"
+
+    def delete_post_by_target(self, folder: str, filename: str, delete_images: bool = True):
+        """
+        특정 (folder, filename) 게시글을 KO, EN, JA 3개 언어에서 영구 삭제하고,
+        tech/index.md 표 행 및 본문 내 첨부 이미지까지 단일 커밋으로 정리합니다.
+        """
+        if not self.repo:
+            return False, "GitHub 저장소 미연결"
+
+        deletes = []
+        updates = {}
+        ko_content = ""
+
+        for prefix in ["", "ja/", "en/"]:
+            path = f"{prefix}{folder}/{filename}"
+            try:
+                file_obj = self.repo.get_contents(path, ref=self.branch)
+                deletes.append(path)
+                if prefix == "":
+                    try:
+                        ko_content = file_obj.decoded_content.decode("utf-8")
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning(f"File not found for deletion ({path}): {e}")
+
+        if not deletes:
+            return False, f"삭제할 파일을 찾을 수 없습니다: [{folder}] {filename}"
+
+        # 본문 내 첨부 이미지(public/images/img_...) 확인 및 삭제 목록 추가
+        if delete_images and ko_content:
+            img_paths = self._extract_image_paths(ko_content)
+            for img_path in img_paths:
+                try:
+                    self.repo.get_contents(img_path, ref=self.branch)
+                    deletes.append(img_path)
+                except Exception:
+                    pass
+
+        # tech 포스트인 경우 3개 국어 tech/index.md에서 테이블 행 제거
+        if folder == "tech":
+            index_removals = self._prepare_tech_index_removals(filename)
+            if index_removals:
+                updates.update(index_removals)
+
+        try:
+            self._commit_multiple_changes(
+                updates=updates,
+                deletes=deletes,
+                commit_message=f"chore: Delete post - {filename}"
+            )
+            summary_lines = [f"🗑️ 삭제된 파일: {p}" for p in deletes]
+            if updates:
+                summary_lines.extend([f"📝 색인 정리: {p}" for p in updates.keys()])
+            return True, "영구 삭제 완료 (단일 커밋):\n" + "\n".join(summary_lines)
+        except Exception as e:
+            return False, f"삭제 처리 중 오류 발생: {e}"
+
+    def unpublish_post(self, keyword):
+        """키워드로 게시글을 찾아 비공개(draft: true)로 전환"""
         if not self.repo:
             return False, "GitHub 저장소 미연결"
 
@@ -348,21 +559,19 @@ class GithubUploader:
             return False, f"일치하는 글이 여러 개 있습니다. 더 정확한 제목을 입력해 주세요:\n" + "\n".join(names)
 
         folder, filename, _ = matches[0]
-        deleted_paths = []
+        return self.unpublish_post_by_target(folder, filename)
 
-        for prefix in ["", "ja/", "en/"]:
-            path = f"{prefix}{folder}/{filename}"
-            try:
-                file_obj = self.repo.get_contents(path, ref=self.branch)
-                self.repo.delete_file(
-                    path=path,
-                    message=f"chore: Delete post - {filename}",
-                    sha=file_obj.sha,
-                    branch=self.branch
-                )
-                deleted_paths.append(path)
-            except Exception as e:
-                logger.warning(f"Failed to delete {path}: {e}")
+    def delete_post(self, keyword):
+        """키워드로 게시글을 찾아 KO, EN, JA 3개 언어 및 색인에서 영구 삭제"""
+        if not self.repo:
+            return False, "GitHub 저장소 미연결"
 
-        return True, f"삭제 완료:\n" + "\n".join(deleted_paths)
+        matches = self.find_post_files(keyword)
+        if not matches:
+            return False, f"'{keyword}'에 해당하는 게시글을 찾을 수 없습니다."
+        if len(matches) > 1:
+            names = [f"[{f}] {n}" for f, n, _ in matches[:5]]
+            return False, f"일치하는 글이 여러 개 있습니다. 더 정확한 제목을 입력해 주세요:\n" + "\n".join(names)
 
+        folder, filename, _ = matches[0]
+        return self.delete_post_by_target(folder, filename)
