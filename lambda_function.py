@@ -1,4 +1,5 @@
 import os
+import time
 import json
 import base64
 import logging
@@ -852,6 +853,18 @@ async def _async_lambda_handler(event, context):
             update_data = body
 
         if update_data:
+            # [방어 0계층] 25초 이상 경과한 웹훅 재시도 및 밀린 대기열 메시지 즉시 폐기 (200 OK 반환으로 재시도 큐 자동 소거)
+            msg_obj = update_data.get("message") or update_data.get("edited_message")
+            if msg_obj and msg_obj.get("date"):
+                msg_age = time.time() - int(msg_obj["date"])
+                if msg_age > 25:
+                    logger.warning(f"[StaleDrop] Ignoring stale webhook update_id={update_data.get('update_id')} (age={msg_age:.1f}s > 25s).")
+                    return {
+                        "statusCode": 200,
+                        "headers": {"Content-Type": "application/json"},
+                        "body": json.dumps({"ok": True, "stale_dropped": True, "age_sec": round(msg_age, 1)})
+                    }
+
             # [방어 1계층] DynamoDB update_id 원자적 선점 (멱등성 보장: 텔레그램 웹훅 타임아웃 재시도 즉시 차단)
             update_id = update_data.get("update_id")
             if update_id is not None and not dynamo_mgr.claim_update_id(update_id):
