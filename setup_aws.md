@@ -16,7 +16,7 @@
 ## 🛠️ 배포 및 설정 단계
 
 ### 1단계: 배포 패키지 빌드 (`lambda_deployment.zip`)
-프로젝트 폴더(`c:\Users\uoosnn\Documents\DEV\telegram_bot`)에서 아래 스크립트를 실행합니다:
+프로젝트 폴더(`c:\Users\uoosnn\Documents\DEV\telegrambot`)에서 아래 스크립트를 실행합니다:
 ```bash
 python build_zip.py
 ```
@@ -43,7 +43,7 @@ python build_zip.py
    - 제한 시간(Timeout): **1분 30초 (90초)**
    - 메모리: **256MB** 또는 **512MB**
 5. **구성(Configuration) ➔ 권한(Permissions)**:
-   - 실행 역할(Role)에 DynamoDB 권한 연결:
+   - 실행 역할(Role)에 DynamoDB 및 비동기 자기 호출(Self-Invocation) 권한 연결:
      ```json
      {
          "Version": "2012-10-17",
@@ -52,6 +52,12 @@ python build_zip.py
                  "Sid": "DynamoDBAccess",
                  "Effect": "Allow",
                  "Action": ["dynamodb:*"],
+                 "Resource": "*"
+             },
+             {
+                 "Sid": "AllowLambdaSelfInvoke",
+                 "Effect": "Allow",
+                 "Action": ["lambda:InvokeFunction"],
                  "Resource": "*"
              }
          ]
@@ -80,9 +86,9 @@ python build_zip.py
 
 ---
 
-### 5단계: 텔레그램 Webhook 등록
-웹 브라우저 주소창이나 curl로 아래 URL을 1회 호출합니다:
+### 5단계: 텔레그램 Webhook 등록 (대기열 초기화 포함)
+웹 브라우저 주소창이나 curl로 아래 URL을 1회 호출합니다 (`drop_pending_updates=true`를 붙이면 밀려있던 중복 웹훅 대기열이 즉시 비워집니다):
 ```text
-https://api.telegram.org/bot<내_TELEGRAM_BOT_TOKEN>/setWebhook?url=https://7kpqtljrkmy3cizcjteqgdptwm0pjexk.lambda-url.ap-northeast-2.on.aws/
+https://api.telegram.org/bot<내_TELEGRAM_BOT_TOKEN>/setWebhook?url=https://7kpqtljrkmy3cizcjteqgdptwm0pjexk.lambda-url.ap-northeast-2.on.aws/&drop_pending_updates=true
 ```
 응답으로 `{"ok":true,"result":true,"description":"Webhook was set"}`가 나오면 완료입니다.

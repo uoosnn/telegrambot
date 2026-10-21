@@ -8,6 +8,7 @@ import hashlib
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import boto3
 from dotenv import load_dotenv
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
@@ -25,6 +26,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
 
 dynamo_mgr = DynamoManager()
 ai_processor = AIProcessor(dynamo_mgr=dynamo_mgr)
@@ -32,6 +34,69 @@ github_uploader = GithubUploader()
 news_scraper = NewsScraper()
 
 POSTS_PER_PAGE = 8
+
+
+# --- Helper: Async Self-Invocation (0.2s Webhook Response) ---
+
+def is_heavy_update(update_data: dict) -> bool:
+    """
+    AI 블로그 생성/번역 등 10초 이상 소요되어 텔레그램 웹훅 타임아웃 재시도를 유발할 수 있는
+    무거운 작업인지 판별합니다.
+    """
+    if "callback_query" in update_data:
+        cb_data = update_data["callback_query"].get("data", "")
+        if cb_data.startswith(("confirm_post_", "del_exec_", "unpub_exec_")):
+            return True
+        return False
+
+    message = update_data.get("message") or update_data.get("edited_message")
+    if not message:
+        return False
+
+    text = (message.get("text") or "").strip()
+    if text.startswith("/"):
+        cmd = text.split(maxsplit=1)[0].lower()
+        if cmd in ["/post", "/techpost", "/draft", "/write"]:
+            return True
+        return False
+
+    # 뉴스 알림에 대한 답장이나 일반 AI 채팅도 시간이 걸릴 수 있으므로 비동기 위임 대상
+    if text or message.get("photo"):
+        return True
+
+    return False
+
+
+def invoke_async_worker(update_data: dict, context) -> bool:
+    """
+    AWS Lambda 자신을 비동기(InvocationType='Event')로 호출하여
+    텔레그램 웹훅에 0.2초 내로 즉시 200 OK를 반환합니다.
+    (만약 IAM Role에 lambda:InvokeFunction 권한이 없으면 False를 반환하여 현재 프로세스에서 안전하게 폴백 실행)
+    """
+    if not context:
+        return False
+    fn_name = getattr(context, "invoked_function_arn", None) or getattr(context, "function_name", None)
+    if not fn_name:
+        return False
+
+    try:
+        lambda_client = boto3.client("lambda", region_name=AWS_REGION)
+        payload = {
+            "is_async_worker": True,
+            "update_data": update_data
+        }
+        response = lambda_client.invoke(
+            FunctionName=fn_name,
+            InvocationType="Event",
+            Payload=json.dumps(payload).encode("utf-8")
+        )
+        status_code = response.get("StatusCode", 0)
+        if status_code in (200, 202):
+            logger.info(f"[AsyncWorker] Dispatched update_id={update_data.get('update_id')} asynchronously (HTTP {status_code}).")
+            return True
+    except Exception as e:
+        logger.warning(f"[AsyncWorker] Self-invocation unavailable ({e}). Falling back to inline execution with DynamoDB lock.")
+    return False
 
 
 # --- Helper: Token ID & Post Management UI ---
@@ -131,7 +196,7 @@ def build_post_list_view(posts: list, page: int = 0, header_text: str = None):
     return header_text, InlineKeyboardMarkup(keyboard)
 
 
-# --- Helper: Split Message Sending ---
+# --- Helper: Split Message Sending & Safe Editing ---
 async def send_split_message(bot: Bot, chat_id: int, text: str, parse_mode=None, reply_markup=None):
     if not text:
         return
@@ -145,6 +210,13 @@ async def send_split_message(bot: Bot, chat_id: int, text: str, parse_mode=None,
             # parse_mode 에러(마크다운 문법 불일치) 발생 시 일반 텍스트로 fallback
             logger.warning(f"Failed to send with parse_mode {parse_mode}: {e}. Retrying plain text.")
             await bot.send_message(chat_id=chat_id, text=chunk, reply_markup=markup)
+
+
+async def safe_edit_message(bot: Bot, chat_id: int, message_id: int, text: str, reply_markup=None):
+    try:
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup)
+    except Exception as e:
+        logger.warning(f"Failed to edit message {message_id}: {e}")
 
 
 # --- 1. Scheduled Task: News Scraper (EventBridge) ---
@@ -251,16 +323,23 @@ async def handle_info_cmd(bot: Bot, chat_id: int):
     await bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
 
 async def handle_draft_cmd(bot: Bot, chat_id: int, title_arg: str):
-    title_instruction = title_arg.strip() if title_arg else None
-    if not title_instruction:
-        try:
-            title_instruction = await asyncio.to_thread(ai_processor.generate_title_from_history, chat_id)
-        except Exception:
-            title_instruction = f"초안 노트 ({datetime.now().strftime('%Y-%m-%d')})"
+    if not dynamo_mgr.acquire_post_lock(chat_id, ttl_sec=120):
+        await bot.send_message(chat_id=chat_id, text="⚠️ 이미 게시글 생성 작업이 진행 중입니다. 완료될 때까지 잠시만 기다려 주세요.")
+        return
 
-    await bot.send_message(chat_id=chat_id, text=f"📝 검색엔진 및 목록에서 제외되는 비공개 초안(draft: true)으로 저장 중입니다... (제목: {title_instruction})")
     try:
+        title_instruction = title_arg.strip() if title_arg else None
+        status_msg = await bot.send_message(chat_id=chat_id, text="📝 [1/2] 비공개 초안(draft: true) 제목 및 본문을 생성 중입니다...")
+
+        if not title_instruction:
+            try:
+                title_instruction = await asyncio.to_thread(ai_processor.generate_title_from_history, chat_id)
+            except Exception:
+                title_instruction = f"초안 노트 ({datetime.now().strftime('%Y-%m-%d')})"
+
         markdown_content = await asyncio.to_thread(ai_processor.generate_blog_post_from_history, title_instruction, chat_id)
+        await safe_edit_message(bot, chat_id, status_msg.message_id, f"🚀 [2/2] GitHub에 비공개 초안 저장 중... (제목: {title_instruction})")
+
         success, result = await asyncio.to_thread(
             github_uploader.save_and_push_draft,
             markdown_content,
@@ -273,16 +352,20 @@ async def handle_draft_cmd(bot: Bot, chat_id: int, title_arg: str):
                 folder, filename = github_uploader.last_uploaded
                 dynamo_mgr.record_recent_post(folder, filename)
                 markup = build_post_Complete_markup(folder, filename)
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"✅ 비공개 초안 저장 성공!\n\n저장 경로: {result}\n*(※ draft: true가 설정되어 사이트 목록 및 Google 검색엔진 색인에서 자동 제외됩니다)*",
+            await safe_edit_message(
+                bot,
+                chat_id,
+                status_msg.message_id,
+                f"✅ 비공개 초안 저장 성공!\n\n저장 경로: {result}\n*(※ draft: true가 설정되어 사이트 목록 및 Google 검색엔진 색인에서 자동 제외됩니다)*",
                 reply_markup=markup
             )
         else:
-            await bot.send_message(chat_id=chat_id, text=f"❌ 깃허브 업로드 실패:\n{result}")
+            await safe_edit_message(bot, chat_id, status_msg.message_id, f"❌ 깃허브 업로드 실패:\n{result}")
     except Exception as e:
         logger.error(f"Error in handle_draft_cmd: {e}", exc_info=True)
         await bot.send_message(chat_id=chat_id, text=f"❌ 오류 발생: {str(e)}")
+    finally:
+        dynamo_mgr.release_post_lock(chat_id)
 
 async def handle_delete_or_unpublish_cmd(bot: Bot, chat_id: int, keyword: str):
     """
@@ -334,30 +417,54 @@ async def handle_delete_or_unpublish_cmd(bot: Bot, chat_id: int, keyword: str):
         await bot.send_message(chat_id=chat_id, text=f"❌ 오류 발생: {str(e)}")
 
 async def handle_post_cmd(bot: Bot, chat_id: int, title_arg: str, folder_name="blog"):
+    # 분산 락(Post Lock)으로 중복 실행 원천 차단
+    if not dynamo_mgr.acquire_post_lock(chat_id, ttl_sec=120):
+        await bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ 이미 게시글 생성 및 번역 작업이 진행 중입니다. 현재 작업이 완료될 때까지 잠시만 기다려 주세요."
+        )
+        return
+
     target_name = "기술 블로그(tech)" if folder_name == "tech" else "블로그(blog)"
     title_instruction = title_arg.strip() if title_arg else None
 
-    if not title_instruction:
-        await bot.send_message(chat_id=chat_id, text="⏳ 대화 내용을 분석하여 제목을 생성 중입니다...")
-        try:
-            title_instruction = await asyncio.to_thread(ai_processor.generate_title_from_history, chat_id)
-        except Exception as e:
-            logger.error(f"Error generating title: {e}")
-            title_instruction = f"대화 기록 ({datetime.now().strftime('%Y-%m-%d')})"
-
-    await bot.send_message(chat_id=chat_id, text=f"⏳ 대화를 정리하여 {target_name}에 포스팅 중입니다... (주제: {title_instruction})")
-
     try:
+        # 여러 개의 새 메시지를 보내지 않고, 단일 상태 메시지를 수정(edit_message_text)하여 진행 상황 표시
+        status_msg = await bot.send_message(
+            chat_id=chat_id,
+            text=f"⏳ [1/3] 대화 내용을 바탕으로 {target_name} 본문을 생성 중입니다..."
+        )
+        msg_id = status_msg.message_id
+
+        if not title_instruction:
+            try:
+                title_instruction = await asyncio.to_thread(ai_processor.generate_title_from_history, chat_id)
+            except Exception as e:
+                logger.error(f"Error generating title: {e}")
+                title_instruction = f"대화 기록 ({datetime.now().strftime('%Y-%m-%d')})"
+
+        await safe_edit_message(
+            bot, chat_id, msg_id,
+            f"⏳ [1/3] {target_name} 마크다운 초안 작성 중...\n• 주제: {title_instruction}"
+        )
+
         markdown_content = await asyncio.to_thread(ai_processor.generate_blog_post_from_history, title_instruction, chat_id)
         if folder_name == "tech":
             markdown_content = markdown_content.replace("tags: [AI, 대화요약]", "tags: [Tech, AI, 기술분석]")
 
-        await bot.send_message(chat_id=chat_id, text="🌐 영문 및 일문으로 자동 번역을 동시에 수행 중입니다...")
+        await safe_edit_message(
+            bot, chat_id, msg_id,
+            f"🌐 [2/3] 영문(EN) 및 일문(JA) 자동 번역을 동시 수행 중...\n• 주제: {title_instruction}"
+        )
         content_en, content_ja = await asyncio.gather(
             asyncio.to_thread(ai_processor.translate_blog_post, markdown_content, "English"),
             asyncio.to_thread(ai_processor.translate_blog_post, markdown_content, "Japanese")
         )
 
+        await safe_edit_message(
+            bot, chat_id, msg_id,
+            f"🚀 [3/3] GitHub 저장소에 3개 국어 파일 및 색인을 단일 커밋으로 업로드 중..."
+        )
         success, result = await asyncio.to_thread(
             github_uploader.save_and_push,
             markdown_content,
@@ -372,27 +479,35 @@ async def handle_post_cmd(bot: Bot, chat_id: int, title_arg: str, folder_name="b
                 folder, filename = github_uploader.last_uploaded
                 dynamo_mgr.record_recent_post(folder, filename)
                 markup = build_post_Complete_markup(folder, filename)
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"✅ {target_name} 포스팅 성공! (단일 커밋 완료)\n\n저장 경로: {result}",
+            await safe_edit_message(
+                bot,
+                chat_id,
+                msg_id,
+                f"✅ {target_name} 포스팅 성공! (단일 커밋 완료)\n\n저장 경로: {result}",
                 reply_markup=markup
             )
         else:
-            await bot.send_message(chat_id=chat_id, text=f"❌ 깃허브 업로드 실패:\n{result}")
+            await safe_edit_message(bot, chat_id, msg_id, f"❌ 깃허브 업로드 실패:\n{result}")
     except Exception as e:
         logger.error(f"Error during post: {e}", exc_info=True)
         await bot.send_message(chat_id=chat_id, text=f"❌ 오류 발생: {str(e)}")
+    finally:
+        dynamo_mgr.release_post_lock(chat_id)
 
 async def handle_write_cmd(bot: Bot, chat_id: int, user_text: str):
     if not user_text:
         await bot.send_message(chat_id=chat_id, text="❌ 작성할 내용(프론트매터 포함 마크다운)을 함께 적어주세요!\n예: `/write ---\ntitle: 제목\n...`")
         return
 
-    await bot.send_message(chat_id=chat_id, text="📝 수동 포스트 업로드를 진행 중입니다...")
-    title_match = re.search(r'title:\s*"?([^"\n]+)"?', user_text)
-    title = title_match.group(1).strip() if title_match else f"직접 작성한 글 ({datetime.now().strftime('%Y-%m-%d %H%M%S')})"
+    if not dynamo_mgr.acquire_post_lock(chat_id, ttl_sec=60):
+        await bot.send_message(chat_id=chat_id, text="⚠️ 이미 업로드 작업이 진행 중입니다. 잠시만 기다려 주세요.")
+        return
 
     try:
+        status_msg = await bot.send_message(chat_id=chat_id, text="📝 수동 포스트 업로드를 진행 중입니다...")
+        title_match = re.search(r'title:\s*"?([^"\n]+)"?', user_text)
+        title = title_match.group(1).strip() if title_match else f"직접 작성한 글 ({datetime.now().strftime('%Y-%m-%d %H%M%S')})"
+
         success, result = await asyncio.to_thread(github_uploader.save_and_push, user_text, title=title)
         if success:
             markup = None
@@ -400,16 +515,20 @@ async def handle_write_cmd(bot: Bot, chat_id: int, user_text: str):
                 folder, filename = github_uploader.last_uploaded
                 dynamo_mgr.record_recent_post(folder, filename)
                 markup = build_post_Complete_markup(folder, filename)
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"✅ 블로그 수동 포스팅 성공!\n\n저장 경로: {result}",
+            await safe_edit_message(
+                bot,
+                chat_id,
+                status_msg.message_id,
+                f"✅ 블로그 수동 포스팅 성공!\n\n저장 경로: {result}",
                 reply_markup=markup
             )
         else:
-            await bot.send_message(chat_id=chat_id, text=f"❌ 깃허브 업로드 실패:\n{result}")
+            await safe_edit_message(bot, chat_id, status_msg.message_id, f"❌ 깃허브 업로드 실패:\n{result}")
     except Exception as e:
         logger.error(f"Error during write: {e}", exc_info=True)
         await bot.send_message(chat_id=chat_id, text=f"❌ 오류 발생: {str(e)}")
+    finally:
+        dynamo_mgr.release_post_lock(chat_id)
 
 async def handle_text_message(bot: Bot, chat_id: int, user_text: str, reply_to_msg: dict = None):
     # 1. 뉴스 메시지에 답장(Reply)한 경우
@@ -418,7 +537,7 @@ async def handle_text_message(bot: Bot, chat_id: int, user_text: str, reply_to_m
         news_info = dynamo_mgr.get_pending_message(reply_to_id)
 
         if news_info:
-            await bot.send_message(chat_id=chat_id, text="⏳ 코멘트를 확인했습니다. 뉴스를 분석하여 블로그 포스트를 작성 중입니다...")
+            status_msg = await bot.send_message(chat_id=chat_id, text="⏳ 코멘트를 확인했습니다. 뉴스를 분석하여 블로그 포스트 초안을 작성 중입니다...")
             try:
                 markdown_content = await asyncio.to_thread(ai_processor.generate_blog_from_news, news_info, user_text)
                 preview = markdown_content[:500] + ("\n..." if len(markdown_content) > 500 else "")
@@ -433,10 +552,10 @@ async def handle_text_message(bot: Bot, chat_id: int, user_text: str, reply_to_m
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
                 dynamo_mgr.save_pending_confirmation(reply_to_id, markdown_content, news_info)
-                await bot.send_message(chat_id=chat_id, text=preview_msg, reply_markup=reply_markup)
+                await safe_edit_message(bot, chat_id, status_msg.message_id, preview_msg, reply_markup=reply_markup)
             except Exception as e:
                 logger.error(f"Error generating news post: {e}", exc_info=True)
-                await bot.send_message(chat_id=chat_id, text=f"❌ 오류 발생: {str(e)}")
+                await safe_edit_message(bot, chat_id, status_msg.message_id, f"❌ 오류 발생: {str(e)}")
             return
         else:
             orig_text = reply_to_msg.get("text", "")
@@ -456,7 +575,7 @@ async def handle_text_message(bot: Bot, chat_id: int, user_text: str, reply_to_m
         await bot.send_message(chat_id=chat_id, text=f"❌ AI 오류: {str(e)}")
 
 async def handle_photo_message(bot: Bot, chat_id: int, photos: list, caption: str):
-    await bot.send_message(chat_id=chat_id, text="⏳ 이미지를 깃허브에 업로드 중입니다...")
+    status_msg = await bot.send_message(chat_id=chat_id, text="⏳ 이미지를 깃허브에 업로드 중입니다...")
     try:
         # 가장 해상도가 높은 마지막 사진 가져오기
         photo = photos[-1]
@@ -473,16 +592,17 @@ async def handle_photo_message(bot: Bot, chat_id: int, photos: list, caption: st
                 context_msg += f"\n사진 설명(캡션): {caption}"
 
             await asyncio.to_thread(ai_processor.send_message, context_msg, chat_id)
-            await bot.send_message(
+            await bot.edit_message_text(
                 chat_id=chat_id,
+                message_id=status_msg.message_id,
                 text=f"✅ 이미지 업로드 완료!\n\nAI가 이 이미지를 인지했습니다. 바로 사용할 수 있는 마크다운 링크입니다:\n`{result}`",
                 parse_mode='Markdown'
             )
         else:
-            await bot.send_message(chat_id=chat_id, text=f"❌ 깃허브 업로드 실패:\n{result}")
+            await safe_edit_message(bot, chat_id, status_msg.message_id, f"❌ 깃허브 업로드 실패:\n{result}")
     except Exception as e:
         logger.error(f"Error uploading photo: {e}", exc_info=True)
-        await bot.send_message(chat_id=chat_id, text=f"❌ 오류 발생: {str(e)}")
+        await safe_edit_message(bot, chat_id, status_msg.message_id, f"❌ 오류 발생: {str(e)}")
 
 async def handle_callback_query(bot: Bot, callback_query: dict):
     cb_id = callback_query.get("id")
@@ -499,21 +619,26 @@ async def handle_callback_query(bot: Bot, callback_query: dict):
     # --- A. 뉴스 기반 포스팅 확인/취소 ---
     if data.startswith("confirm_post_"):
         reply_to_id = int(data.replace("confirm_post_", ""))
-        confirmation = dynamo_mgr.get_pending_confirmation(reply_to_id)
-
-        if not confirmation:
-            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text="⚠️ 해당 게시글 데이터를 찾을 수 없습니다. (만료되었거나 이미 처리됨)")
+        if not dynamo_mgr.acquire_post_lock(chat_id, ttl_sec=120):
             return
 
-        markdown_content = confirmation['markdown_content']
-        await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text="🌐 영문 및 일문으로 자동 번역을 동시에 수행 중입니다...")
-
         try:
+            confirmation = dynamo_mgr.get_pending_confirmation(reply_to_id)
+            if not confirmation:
+                await safe_edit_message(bot, chat_id, msg_id, "⚠️ 해당 게시글 데이터를 찾을 수 없습니다. (만료되었거나 이미 처리됨)")
+                return
+
+            # 중복 클릭/재시도 방지를 위해 확인 데이터 선제 삭제
+            dynamo_mgr.delete_pending_confirmation(reply_to_id)
+            markdown_content = confirmation['markdown_content']
+            await safe_edit_message(bot, chat_id, msg_id, "🌐 [1/2] 영문 및 일문으로 자동 번역을 동시에 수행 중입니다...")
+
             content_en, content_ja = await asyncio.gather(
                 asyncio.to_thread(ai_processor.translate_blog_post, markdown_content, "English"),
                 asyncio.to_thread(ai_processor.translate_blog_post, markdown_content, "Japanese")
             )
 
+            await safe_edit_message(bot, chat_id, msg_id, "🚀 [2/2] GitHub 저장소에 단일 커밋으로 업로드 중입니다...")
             success, result = await asyncio.to_thread(
                 github_uploader.save_and_push,
                 markdown_content,
@@ -526,35 +651,37 @@ async def handle_callback_query(bot: Bot, callback_query: dict):
                     folder, filename = github_uploader.last_uploaded
                     dynamo_mgr.record_recent_post(folder, filename)
                     markup = build_post_Complete_markup(folder, filename)
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    text=f"✅ 뉴스 기반 블로그 포스팅 성공! (단일 커밋 완료)\n\n저장 경로: {result}",
+                await safe_edit_message(
+                    bot,
+                    chat_id,
+                    msg_id,
+                    f"✅ 뉴스 기반 블로그 포스팅 성공! (단일 커밋 완료)\n\n저장 경로: {result}",
                     reply_markup=markup
                 )
-                dynamo_mgr.delete_pending_confirmation(reply_to_id)
                 dynamo_mgr.delete_pending_message(reply_to_id)
             else:
-                await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=f"❌ 깃허브 업로드 실패:\n{result}")
+                await safe_edit_message(bot, chat_id, msg_id, f"❌ 깃허브 업로드 실패:\n{result}")
         except Exception as e:
             logger.error(f"Error posting confirmed news: {e}", exc_info=True)
-            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=f"❌ 오류 발생: {str(e)}")
+            await safe_edit_message(bot, chat_id, msg_id, f"❌ 오류 발생: {str(e)}")
+        finally:
+            dynamo_mgr.release_post_lock(chat_id)
 
     elif data.startswith("cancel_post_"):
         reply_to_id = int(data.replace("cancel_post_", ""))
         dynamo_mgr.delete_pending_confirmation(reply_to_id)
-        await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text="❌ 게시가 취소되었습니다.")
+        await safe_edit_message(bot, chat_id, msg_id, "❌ 게시가 취소되었습니다.")
 
     # --- B. 게시글 간편 삭제 및 비공개 관리 콜백 ---
     elif data == "del_close":
-        await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text="✅ 게시글 관리 창을 닫았습니다.")
+        await safe_edit_message(bot, chat_id, msg_id, "✅ 게시글 관리 창을 닫았습니다.")
 
     elif data.startswith("del_page_"):
         page = int(data.replace("del_page_", ""))
         recent_hints = dynamo_mgr.get_recent_posts()
         all_posts = await asyncio.to_thread(github_uploader.list_all_posts, recent_hints)
         if not all_posts:
-            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text="⚠️ 저장소에서 게시글을 찾을 수 없습니다.")
+            await safe_edit_message(bot, chat_id, msg_id, "⚠️ 저장소에서 게시글을 찾을 수 없습니다.")
             return
         text, markup = build_post_list_view(all_posts, page=page)
         await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, parse_mode='Markdown', reply_markup=markup)
@@ -563,7 +690,7 @@ async def handle_callback_query(bot: Bot, callback_query: dict):
         token_id = data.replace("del_sel_", "")
         folder, filename = await asyncio.to_thread(resolve_post_token, token_id)
         if not folder or not filename:
-            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text="⚠️ 선택한 게시글 정보를 찾을 수 없거나 이미 삭제되었습니다.")
+            await safe_edit_message(bot, chat_id, msg_id, "⚠️ 선택한 게시글 정보를 찾을 수 없거나 이미 삭제되었습니다.")
             return
         text, markup = build_post_confirm_view(folder, filename)
         await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, parse_mode='Markdown', reply_markup=markup)
@@ -572,51 +699,54 @@ async def handle_callback_query(bot: Bot, callback_query: dict):
         token_id = data.replace("del_exec_", "")
         folder, filename = await asyncio.to_thread(resolve_post_token, token_id)
         if not folder or not filename:
-            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text="⚠️ 삭제할 게시글 정보를 찾을 수 없거나 이미 삭제되었습니다.")
+            await safe_edit_message(bot, chat_id, msg_id, "⚠️ 삭제할 게시글 정보를 찾을 수 없거나 이미 삭제되었습니다.")
             return
 
-        await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=msg_id,
-            text=f"⏳ `[{folder}] {filename}` 게시글(KO/EN/JA), 색인 및 첨부 이미지를 단일 커밋으로 영구 삭제 중입니다..."
+        await safe_edit_message(
+            bot,
+            chat_id,
+            msg_id,
+            f"⏳ [{folder}] {filename} 게시글(KO/EN/JA), 색인 및 첨부 이미지를 단일 커밋으로 영구 삭제 중입니다..."
         )
         try:
             success, result = await asyncio.to_thread(github_uploader.delete_post_by_target, folder, filename)
             if success:
                 dynamo_mgr.remove_recent_post(folder, filename)
                 dynamo_mgr.delete_delete_target(token_id)
-                await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=f"✅ {result}")
+                await safe_edit_message(bot, chat_id, msg_id, f"✅ {result}")
             else:
-                await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=f"⚠️ {result}")
+                await safe_edit_message(bot, chat_id, msg_id, f"⚠️ {result}")
         except Exception as e:
             logger.error(f"Error in del_exec callback: {e}", exc_info=True)
-            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=f"❌ 삭제 중 오류 발생: {str(e)}")
+            await safe_edit_message(bot, chat_id, msg_id, f"❌ 삭제 중 오류 발생: {str(e)}")
 
     elif data.startswith("unpub_exec_"):
         token_id = data.replace("unpub_exec_", "")
         folder, filename = await asyncio.to_thread(resolve_post_token, token_id)
         if not folder or not filename:
-            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text="⚠️ 비공개 전환할 게시글 정보를 찾을 수 없습니다.")
+            await safe_edit_message(bot, chat_id, msg_id, "⚠️ 비공개 전환할 게시글 정보를 찾을 수 없습니다.")
             return
 
-        await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=msg_id,
-            text=f"⏳ `[{folder}] {filename}` 게시글을 비공개(draft: true)로 전환 중입니다..."
+        await safe_edit_message(
+            bot,
+            chat_id,
+            msg_id,
+            f"⏳ [{folder}] {filename} 게시글을 비공개(draft: true)로 전환 중입니다..."
         )
         try:
             success, result = await asyncio.to_thread(github_uploader.unpublish_post_by_target, folder, filename)
             if success:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    text=f"✅ {result}\n*(※ 사이트 목록 및 검색엔진 색인에서 제외됩니다)*"
+                await safe_edit_message(
+                    bot,
+                    chat_id,
+                    msg_id,
+                    f"✅ {result}\n*(※ 사이트 목록 및 검색엔진 색인에서 제외됩니다)*"
                 )
             else:
-                await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=f"⚠️ {result}")
+                await safe_edit_message(bot, chat_id, msg_id, f"⚠️ {result}")
         except Exception as e:
             logger.error(f"Error in unpub_exec callback: {e}", exc_info=True)
-            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=f"❌ 비공개 전환 중 오류 발생: {str(e)}")
+            await safe_edit_message(bot, chat_id, msg_id, f"❌ 비공개 전환 중 오류 발생: {str(e)}")
 
 
 # --- 3. Unified Update Dispatcher ---
@@ -680,14 +810,25 @@ async def dispatch_telegram_update(bot: Bot, update_data: dict):
 # --- 4. Main Lambda Handler ---
 
 async def _async_lambda_handler(event, context):
-    logger.info(f"Received event: {json.dumps(event, default=str)}")
-
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN is missing.")
         return {"statusCode": 500, "body": "TELEGRAM_BOT_TOKEN is missing."}
 
     bot = Bot(token=token)
+
+    # 0. 비동기 워커 호출(Self-Invocation) 처리
+    if event.get("is_async_worker"):
+        update_data = event.get("update_data", {})
+        logger.info(f"[AsyncWorker] Executing background update_id={update_data.get('update_id')}")
+        await dispatch_telegram_update(bot, update_data)
+        return {
+            "statusCode": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body": json.dumps({"ok": True, "worker": True})
+        }
+
+    logger.info(f"Received event: {json.dumps(event, default=str)}")
 
     # 1. EventBridge Scheduled Event Check (매일 아침 9시 뉴스)
     if event.get("source") == "aws.events" or event.get("detail-type") == "Scheduled Event":
@@ -711,6 +852,24 @@ async def _async_lambda_handler(event, context):
             update_data = body
 
         if update_data:
+            # [방어 1계층] DynamoDB update_id 원자적 선점 (멱등성 보장: 텔레그램 웹훅 타임아웃 재시도 즉시 차단)
+            update_id = update_data.get("update_id")
+            if update_id is not None and not dynamo_mgr.claim_update_id(update_id):
+                return {
+                    "statusCode": 200,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps({"ok": True, "duplicate_ignored": True})
+                }
+
+            # [방어 2계층] 무거운 작업(/post, /techpost 등)은 비동기 워커(Self-Invocation)로 위임하여 0.2초 내 200 OK 반환
+            if is_heavy_update(update_data) and invoke_async_worker(update_data, context):
+                return {
+                    "statusCode": 200,
+                    "headers": {"Content-Type": "application/json"},
+                    "body": json.dumps({"ok": True, "async_dispatched": True})
+                }
+
+            # 단문 명령어(/start, /info, /delete 목록 등) 또는 Self-Invocation 권한 미설정 시 인라인 실행
             await dispatch_telegram_update(bot, update_data)
 
         return {

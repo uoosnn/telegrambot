@@ -15,6 +15,8 @@ class DynamoManager:
     def __init__(self, table_name=None):
         self.table_name = table_name or TABLE_NAME
         self._local_targets = {}
+        self._processed_updates = set()
+        self._local_locks = {}
         try:
             self.dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
             self.table = self.dynamodb.Table(self.table_name)
@@ -299,3 +301,92 @@ class DynamoManager:
                 )
         except Exception as e:
             logger.error(f"Error removing recent post: {e}")
+
+    # 7. Webhook Deduplication (Idempotency) & Per-Chat Post Mutex Lock
+    def claim_update_id(self, update_id: int) -> bool:
+        """
+        텔레그램 웹훅의 update_id를 원자적 조건부 쓰기(attribute_not_exists)로 선점합니다.
+        이미 처리 중이거나 처리된 update_id(타임아웃 재시도 요청)인 경우 False를 반환합니다.
+        """
+        if update_id is None:
+            return True
+        uid_str = str(update_id)
+        if uid_str in self._processed_updates:
+            return False
+
+        now = int(time.time())
+        if not self.table:
+            self._processed_updates.add(uid_str)
+            return True
+
+        try:
+            self.table.put_item(
+                Item={
+                    "PK": "PROCESSED_UPDATE",
+                    "SK": uid_str,
+                    "created_at": now,
+                    "ttl": now + 86400  # 24시간 후 자동 삭제
+                },
+                ConditionExpression="attribute_not_exists(PK)"
+            )
+            self._processed_updates.add(uid_str)
+            return True
+        except ClientError as ce:
+            if ce.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                logger.warning(f"[Idempotency] Duplicate Telegram update_id={uid_str} blocked.")
+                self._processed_updates.add(uid_str)
+                return False
+            logger.error(f"DynamoDB error in claim_update_id: {ce}")
+            return True
+        except Exception as e:
+            logger.error(f"Unexpected error in claim_update_id: {e}")
+            return True
+
+    def acquire_post_lock(self, chat_id: int, ttl_sec: int = 120) -> bool:
+        """
+        동일 채팅방에서 블로그 생성/번역 작업이 중복 실행되지 않도록 분산 락을 획득합니다.
+        이전 락이 없거나 만료(ttl < now)된 경우에만 True를 반환합니다.
+        """
+        cid_str = str(chat_id)
+        now = int(time.time())
+
+        if not self.table:
+            exp = self._local_locks.get(cid_str, 0)
+            if exp > now:
+                return False
+            self._local_locks[cid_str] = now + ttl_sec
+            return True
+
+        try:
+            self.table.put_item(
+                Item={
+                    "PK": "POST_LOCK",
+                    "SK": cid_str,
+                    "locked_at": now,
+                    "ttl": now + ttl_sec
+                },
+                ConditionExpression="attribute_not_exists(PK) OR #ttl < :now",
+                ExpressionAttributeNames={"#ttl": "ttl"},
+                ExpressionAttributeValues={":now": now}
+            )
+            return True
+        except ClientError as ce:
+            if ce.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                logger.warning(f"[PostLock] Concurrent post job blocked for chat_id={cid_str}")
+                return False
+            logger.error(f"DynamoDB error in acquire_post_lock: {ce}")
+            return True
+        except Exception as e:
+            logger.error(f"Unexpected error in acquire_post_lock: {e}")
+            return True
+
+    def release_post_lock(self, chat_id: int):
+        """블로그 생성/번역 완료 또는 실패 시 즉시 분산 락을 해제합니다."""
+        cid_str = str(chat_id)
+        self._local_locks.pop(cid_str, None)
+        if not self.table:
+            return
+        try:
+            self.table.delete_item(Key={"PK": "POST_LOCK", "SK": cid_str})
+        except Exception as e:
+            logger.error(f"Error releasing post lock: {e}")
