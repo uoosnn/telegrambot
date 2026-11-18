@@ -18,6 +18,7 @@ from dynamo_manager import DynamoManager
 from ai_processor import AIProcessor
 from github_uploader import GithubUploader
 from news_scraper import NewsScraper
+from cve_scraper import CVEScraper
 
 load_dotenv()
 
@@ -33,6 +34,7 @@ dynamo_mgr = DynamoManager()
 ai_processor = AIProcessor(dynamo_mgr=dynamo_mgr)
 github_uploader = GithubUploader()
 news_scraper = NewsScraper()
+cve_scraper = CVEScraper()
 
 POSTS_PER_PAGE = 8
 
@@ -57,7 +59,7 @@ def is_heavy_update(update_data: dict) -> bool:
     text = (message.get("text") or "").strip()
     if text.startswith("/"):
         cmd = text.split(maxsplit=1)[0].lower()
-        if cmd in ["/post", "/techpost", "/draft", "/write"]:
+        if cmd in ["/post", "/techpost", "/draft", "/write", "/cve"]:
             return True
         return False
 
@@ -220,59 +222,101 @@ async def safe_edit_message(bot: Bot, chat_id: int, message_id: int, text: str, 
         logger.warning(f"Failed to edit message {message_id}: {e}")
 
 
-# --- 1. Scheduled Task: News Scraper (EventBridge) ---
+# --- 1. Scheduled Task: CVE Security Alert Monitor (EventBridge) ---
+# (※ 기존 일반 뉴스 수집 기능은 비활성화되었으며, 보안 취약점/CVE 자동 알림으로 대체되었습니다)
 
-async def handle_scheduled_news(bot: Bot):
-    if not CHAT_ID or not news_scraper:
-        logger.warning("CHAT_ID or news_scraper is not configured.")
+async def handle_scheduled_cve(
+    bot: Bot,
+    target_chat_id: int = None,
+    custom_keyword: str = None,
+    notify_if_empty: bool = False,
+    ignore_sent: bool = False,
+):
+    dest_chat_id = target_chat_id or CHAT_ID
+    if not dest_chat_id or not cve_scraper:
+        logger.warning("CHAT_ID or cve_scraper is not configured.")
         return {"status": "skipped", "reason": "missing config"}
 
-    logger.info("Starting scheduled news scrape...")
+    logger.info(f"Starting CVE security vulnerability check (keyword={custom_keyword})...")
     try:
-        game_news = news_scraper.fetch_game_news(limit=1)
-        trending_news = news_scraper.fetch_trending_news(limit=2, threshold=2)
-        japan_news = news_scraper.fetch_japan_news(limit=2)
+        sent_ids = set() if ignore_sent else dynamo_mgr.get_sent_news()
+        cves = await asyncio.to_thread(
+            cve_scraper.fetch_Filtered_cves,
+            limit=5,
+            lookback_hours=72 if custom_keyword else 48,
+            exclude_ids=sent_ids,
+            custom_keyword=custom_keyword,
+        )
 
-        all_news = game_news + trending_news + japan_news
-        sent_urls = dynamo_mgr.get_sent_news()
-        new_news = [n for n in all_news if n.get('url') not in sent_urls]
+        # 수동 조회(/cve)인데 신규 미발송 건이 없을 경우, 기발송 여부 무관하게 최근 주요 CVE 3건을 조회하여 표시
+        if not cves and notify_if_empty and not ignore_sent:
+            cves = await asyncio.to_thread(
+                cve_scraper.fetch_Filtered_cves,
+                limit=3,
+                lookback_hours=120,
+                exclude_ids=set(),
+                custom_keyword=custom_keyword,
+            )
+            if cves:
+                await bot.send_message(
+                    chat_id=dest_chat_id,
+                    text="ℹ️ 새로 추가된 미발송 CVE는 없으며, 최근 등록된 주요 보안 취약점(CVE) 내역입니다.",
+                )
 
-        if not new_news:
-            logger.info("No new news to send.")
-            return {"status": "ok", "message": "no new news"}
+        if not cves:
+            logger.info("No new matching CVEs to send.")
+            if notify_if_empty:
+                kw_msg = f" ('{custom_keyword}' 관련)" if custom_keyword else ""
+                await bot.send_message(
+                    chat_id=dest_chat_id,
+                    text=f"✅ 최근 등록된 주요 보안 취약점(CVE){kw_msg} 중 새로운 알림 대상이 없습니다.",
+                )
+            return {"status": "ok", "message": "no new cves"}
 
-        newly_sent_urls = []
-        for news in new_news:
-            msg_text = f"📰 **새로운 뉴스 알림**\n\n"
-            msg_text += f"**제목:** {news['title']}\n"
-            if news.get('trend_keyword'):
-                msg_text += f"🔥 **트렌드 키워드:** {news['trend_keyword']} (여러 기사 발생)\n"
-            msg_text += f"\n🔗 [원문 보기]({news['url']})\n\n"
-            msg_text += "💡 *이 메시지에 답장(Reply)으로 코멘트를 남기시면 AI가 블로그 글로 작성합니다.*"
+        # 한국어 1~2문장 요약 일괄 생성 (Gemini Flash 1회 호출, 실패 시 영문 원문만 즉시 전송)
+        ko_summaries = {}
+        if ai_processor:
+            ko_summaries = await asyncio.to_thread(ai_processor.summarize_cves_ko, cves)
 
+        newly_sent_ids = []
+        for item in cves:
+            cid = item["cve_id"]
+            ko_text = ko_summaries.get(cid)
+            msg_text = cve_scraper.format_cve_message(item, ko_summary=ko_text)
             try:
-                sent_msg = await bot.send_message(chat_id=CHAT_ID, text=msg_text, parse_mode='Markdown')
-                dynamo_mgr.save_pending_message(sent_msg.message_id, news)
-                newly_sent_urls.append(news['url'])
+                await bot.send_message(
+                    chat_id=dest_chat_id,
+                    text=msg_text,
+                    disable_web_page_preview=True,
+                )
+                newly_sent_ids.append(cid)
             except Exception as e:
-                logger.error(f"Error sending news message: {e}")
+                logger.error(f"Error sending CVE alert {cid}: {e}")
 
-        if newly_sent_urls:
-            dynamo_mgr.add_sent_news(newly_sent_urls)
+        if newly_sent_ids and not custom_keyword:
+            dynamo_mgr.add_sent_news(newly_sent_ids)
 
-        return {"status": "ok", "sent_count": len(newly_sent_urls)}
+        return {"status": "ok", "sent_count": len(newly_sent_ids), "cves": newly_sent_ids}
     except Exception as e:
-        logger.error(f"Error in handle_scheduled_news: {e}")
+        logger.error(f"Error in handle_scheduled_cve: {e}", exc_info=True)
+        if notify_if_empty:
+            await bot.send_message(chat_id=dest_chat_id, text=f"❌ CVE 조회 중 오류 발생: {str(e)}")
         return {"status": "error", "error": str(e)}
+
+
+async def handle_scheduled_news(bot: Bot):
+    """EventBridge 스케줄러 하위 호환 엔트리포인트 (일반 뉴스 비활성화 -> CVE 보안 알림 실행)"""
+    return await handle_scheduled_cve(bot)
 
 
 # --- 2. Direct Dispatch Handlers ---
 
 async def handle_start_cmd(bot: Bot, chat_id: int):
     welcome_msg = (
-        "안녕하세요! 저는 뉴스 알림 & AI 비서 봇 (서버리스 버전)입니다.\n"
-        "매일 아침 9시에 핫이슈 뉴스와 게임 뉴스를 전달해 드립니다.\n\n"
+        "안녕하세요! 저는 보안 취약점(CVE) 알림 & AI 기술 비서 봇 (서버리스 버전)입니다.\n"
+        "※ 일반 뉴스 알림 기능은 비활성화되었으며, 관심 스택(Linux, Web/APM, DB, AWS, Docker 등) 및 Critical/실제 악용(CISA KEV) CVE가 등록되면 자동으로 텔레그램 알림을 발송합니다.\n\n"
         "**명령어 안내**\n"
+        "/cve [키워드(선택)] - 최신 주요 CVE 보안 취약점 즉시 조회 (예: `/cve`, `/cve linux`)\n"
         "/reset - 대화 내용을 초기화하고 새 대화를 시작합니다.\n"
         "/post [제목] - 대화를 블로그(blog)에 포스팅\n"
         "/techpost [제목] - 기술 블로그(tech)에 포스팅\n"
@@ -281,8 +325,7 @@ async def handle_start_cmd(bot: Bot, chat_id: int):
         "/unpublish [키워드(생략가능)] - 기존 발행 글을 비공개(초안)로 전환\n"
         "/write - 마크다운 직접 입력 포스팅\n"
         "/usage - API 토큰 사용량 확인\n"
-        "/info - 전체 명령어 목록\n"
-        "*(뉴스를 블로그에 올리려면 봇이 보낸 뉴스 메시지에 답장(Reply)하세요)*"
+        "/info - 전체 명령어 목록"
     )
     ai_processor.start_new_session(chat_id)
     await bot.send_message(chat_id=chat_id, text=welcome_msg)
@@ -309,6 +352,7 @@ async def handle_usage_cmd(bot: Bot, chat_id: int):
 async def handle_info_cmd(bot: Bot, chat_id: int):
     msg = (
         "📋 **사용 가능한 명령어 목록 (서버리스)**\n\n"
+        "/cve [키워드(선택)] - 최신 주요 CVE 보안 취약점 즉시 조회 (예: `/cve`, `/cve docker`)\n"
         "/start - 봇 시작 및 초기화\n"
         "/reset - 대화 내용 초기화 (새 대화 시작)\n"
         "/post [제목] - 대화 내용을 블로그(blog)에 포스팅\n"
@@ -319,7 +363,7 @@ async def handle_info_cmd(bot: Bot, chat_id: int):
         "/write - 마크다운 직접 입력 포스팅\n"
         "/usage - API 사용량 및 예상 요금 확인\n"
         "/info - 이 명령어 목록 표시\n\n"
-        "💡 *키워드 없이 `/delete`만 입력하면 전체 게시글을 버튼으로 보며 쉽게 삭제할 수 있습니다.*"
+        "🛡️ *일반 뉴스 알림은 비활성화되었으며, 주요 CVE(내 관심 스택 + Critical + CISA KEV) 자동 알림이 작동 중입니다.*"
     )
     await bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
 
@@ -801,6 +845,24 @@ async def dispatch_telegram_update(bot: Bot, update_data: dict):
             await handle_delete_or_unpublish_cmd(bot, chat_id, args)
         elif cmd in ["/write"]:
             await handle_write_cmd(bot, chat_id, args)
+        elif cmd in ["/cve", "/vuln"]:
+            kw = args.strip() if args else None
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"🔍 최신 CVE 보안 취약점({kw if kw else '관심 스택 + Critical + CISA KEV'})을 조회 중입니다...",
+            )
+            await handle_scheduled_cve(
+                bot,
+                target_chat_id=chat_id,
+                custom_keyword=kw,
+                notify_if_empty=True,
+                ignore_sent=bool(kw),
+            )
+        elif cmd in ["/news"]:
+            await bot.send_message(
+                chat_id=chat_id,
+                text="🔕 일반 뉴스 알림 기능은 비활성화되었습니다.\n대신 보안 취약점(CVE) 자동 알림이 활성화되어 있으며, `/cve` 명령어로 언제든 최신 취약점을 조회할 수 있습니다.",
+            )
         return
 
     # Text message

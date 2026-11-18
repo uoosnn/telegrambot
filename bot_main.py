@@ -18,6 +18,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 from ai_processor import AIProcessor
 from github_uploader import GithubUploader
 from news_scraper import NewsScraper
+from cve_scraper import CVEScraper
 from auto_push import start_auto_push_watcher
 
 load_dotenv()
@@ -88,6 +89,11 @@ except Exception as e:
     logger.error(f"News Scraper init failed: {e}")
     news_scraper = None
 
+try:
+    cve_scraper = CVEScraper()
+except Exception as e:
+    logger.error(f"CVE Scraper init failed: {e}")
+    cve_scraper = None
 
 
 SENT_NEWS_FILE = "sent_news.json"
@@ -108,61 +114,81 @@ def save_sent_news(sent_urls):
     except Exception:
         pass
 
-async def send_news_task(bot_app):
-    """뉴스를 스크래핑하고 텔레그램으로 전송합니다."""
-    if not CHAT_ID or not news_scraper:
+async def send_cve_task(bot_app, target_chat_id=None, custom_keyword=None, notify_if_empty=False, ignore_sent=False):
+    """신규 CVE 보안 취약점을 수집하고 텔레그램으로 전송합니다. (기존 일반 뉴스 알림은 비활성화됨)"""
+    dest_chat_id = target_chat_id or CHAT_ID
+    if not dest_chat_id or not cve_scraper:
         return
-        
+
     try:
-        # 1. 게임 뉴스 가져오기 (1개)
-        game_news = await asyncio.to_thread(news_scraper.fetch_game_news, limit=1)
-        # 2. 트렌딩 뉴스 가져오기 (2개)
-        trending_news = await asyncio.to_thread(news_scraper.fetch_trending_news, limit=2, threshold=2)
-        # 3. 일본 시사 뉴스 가져오기 (2개)
-        japan_news = await asyncio.to_thread(news_scraper.fetch_japan_news, limit=2)
-        
-        all_news = game_news + trending_news + japan_news
-        
-        sent_urls = load_sent_news()
-        new_news = [n for n in all_news if n['url'] not in sent_urls]
-        
-        if not new_news:
-            logger.info("오늘 전송할 새로운 뉴스가 없습니다. (모두 이미 전송됨)")
+        sent_ids = set() if ignore_sent else load_sent_news()
+        cves = await asyncio.to_thread(
+            cve_scraper.fetch_Filtered_cves,
+            limit=5,
+            lookback_hours=72 if custom_keyword else 48,
+            exclude_ids=sent_ids,
+            custom_keyword=custom_keyword,
+        )
+
+        if not cves and notify_if_empty and not ignore_sent:
+            cves = await asyncio.to_thread(
+                cve_scraper.fetch_Filtered_cves,
+                limit=3,
+                lookback_hours=120,
+                exclude_ids=set(),
+                custom_keyword=custom_keyword,
+            )
+            if cves:
+                await bot_app.bot.send_message(
+                    chat_id=dest_chat_id,
+                    text="ℹ️ 새로 추가된 미발송 CVE는 없으며, 최근 등록된 주요 보안 취약점(CVE) 내역입니다.",
+                )
+
+        if not cves:
+            logger.info("전송할 새로운 주요 CVE 보안 취약점이 없습니다.")
+            if notify_if_empty:
+                kw_msg = f" ('{custom_keyword}' 관련)" if custom_keyword else ""
+                await bot_app.bot.send_message(
+                    chat_id=dest_chat_id,
+                    text=f"✅ 최근 등록된 주요 보안 취약점(CVE){kw_msg} 중 새로운 알림 대상이 없습니다.",
+                )
             return
 
-        for news in new_news:
-            msg_text = f"📰 **새로운 뉴스 알림**\n\n"
-            msg_text += f"**제목:** {news['title']}\n"
-            if news.get('trend_keyword'):
-                msg_text += f"🔥 **트렌드 키워드:** {news['trend_keyword']} (여러 기사 발생)\n"
-            msg_text += f"\n🔗 [원문 보기]({news['url']})\n\n"
-            msg_text += "💡 *이 메시지에 답장(Reply)으로 코멘트를 남기시면 AI가 블로그 글로 작성합니다.*"
-            
+        ko_summaries = {}
+        if ai_processor:
+            ko_summaries = await asyncio.to_thread(ai_processor.summarize_cves_ko, cves)
+
+        for item in cves:
+            cid = item["cve_id"]
+            ko_text = ko_summaries.get(cid)
+            msg_text = cve_scraper.format_cve_message(item, ko_summary=ko_text)
             try:
-                sent_msg = await bot_app.bot.send_message(chat_id=CHAT_ID, text=msg_text, parse_mode='Markdown')
-                # 봇이 보낸 메시지 ID를 키로 하여 원본 포스트 데이터를 저장
-                pending_messages[sent_msg.message_id] = {
-                    'news_data': news
-                }
-                sent_urls.add(news['url'])
+                await bot_app.bot.send_message(
+                    chat_id=dest_chat_id,
+                    text=msg_text,
+                    disable_web_page_preview=True,
+                )
+                if not custom_keyword:
+                    sent_ids.add(cid)
             except Exception as e:
-                logger.error(f"Error sending telegram message: {e}")
-                
-        save_sent_news(sent_urls)
-        save_state()
-                
+                logger.error(f"Error sending CVE telegram message: {e}")
+
+        if not custom_keyword:
+            save_sent_news(sent_ids)
+
     except Exception as e:
-        logger.error(f"Error fetching news: {e}")
+        logger.error(f"Error fetching CVEs: {e}")
 
 
 def run_scheduler(loop, bot_app):
     def job():
-        asyncio.run_coroutine_threadsafe(send_news_task(bot_app), loop)
+        asyncio.run_coroutine_threadsafe(send_cve_task(bot_app), loop)
         
-    # 매일 아침 9시에 전송
+    # 매일 아침 9시 및 주기적으로 CVE 보안 취약점 체크
     schedule.every().day.at("09:00").do(job)
+    schedule.every(6).hours.do(job)
     
-    # [테스트용] 봇이 켜질 때 즉시 한번 전송합니다.
+    # 봇이 켜질 때 즉시 한번 체크합니다.
     job()
     
     while True:
@@ -173,15 +199,15 @@ def run_scheduler(loop, bot_app):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """봇 시작 및 초기화 명령어"""
     welcome_msg = (
-        "안녕하세요! 저는 뉴스 알림 & AI 비서 봇입니다.\n"
-        "매일 아침 9시에 핫이슈 뉴스와 게임 뉴스를 전달해 드립니다.\n\n"
+        "안녕하세요! 저는 보안 취약점(CVE) 알림 & AI 비서 봇입니다.\n"
+        "※ 일반 뉴스 알림은 비활성화되었으며, 관심 스택(Linux, Web/APM, DB, AWS, Docker 등) 및 Critical/실제 악용(CISA KEV) CVE 등록 시 자동으로 알림을 보내드립니다.\n\n"
         "**명령어 안내**\n"
+        "/cve [키워드(선택)] - 최신 주요 CVE 보안 취약점 즉시 조회\n"
         "/reset - 대화 내용을 초기화하고 새 대화를 시작합니다.\n"
-        "/post [제목] - 지금까지의 1:1 대화를 바탕으로 블로그 포스트를 올립니다.\n"
-        "*(뉴스를 블로그에 올리려면 봇이 보낸 뉴스 메시지에 답장(Reply)하세요)*"
+        "/post [제목] - 지금까지의 1:1 대화를 바탕으로 블로그 포스트를 올립니다."
     )
     if ai_processor:
-        ai_processor.start_new_session()
+        ai_processor.start_new_session(update.effective_chat.id)
     await update.message.reply_text(welcome_msg)
 
 
@@ -442,10 +468,26 @@ async def write_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ 오류 발생: {str(e)}")
 
 
+async def cve_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """최신 주요 CVE 보안 취약점 즉시 조회"""
+    kw = " ".join(context.args).strip() if context.args else None
+    await update.message.reply_text(
+        f"🔍 최신 CVE 보안 취약점({kw if kw else '관심 스택 + Critical + CISA KEV'})을 조회 중입니다..."
+    )
+    await send_cve_task(
+        context.application,
+        target_chat_id=update.effective_chat.id,
+        custom_keyword=kw,
+        notify_if_empty=True,
+        ignore_sent=bool(kw),
+    )
+
+
 async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """사용 가능한 모든 명령어를 나열합니다."""
     msg = (
         "📋 **사용 가능한 명령어 목록**\n\n"
+        "/cve [키워드(선택)] - 최신 주요 CVE 보안 취약점 즉시 조회 (예: `/cve`, `/cve linux`)\n"
         "/start - 봇 시작 및 초기화\n"
         "/reset - 대화 내용 초기화 (새 대화 시작)\n"
         "/new - /reset과 동일\n"
@@ -456,7 +498,7 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/usage - API 사용량 및 예상 요금 확인\n"
         "/uptime - 봇 가동 시간 확인\n"
         "/info - 이 명령어 목록 표시\n\n"
-        "💡 *봇이 보낸 뉴스에 답장(Reply)하면 AI가 게시글을 작성하고 확인을 요청합니다.*"
+        "🛡️ *일반 뉴스 알림은 비활성화되었으며, 주요 CVE 보안 취약점 자동 알림이 활성화되어 있습니다.*"
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
 
@@ -634,6 +676,8 @@ def main():
 
     # Handlers
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("cve", cve_command))
+    application.add_handler(CommandHandler("vuln", cve_command))
     application.add_handler(CommandHandler("reset", reset_command))
     application.add_handler(CommandHandler("new", reset_command))
     application.add_handler(CommandHandler("post", post_command))

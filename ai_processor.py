@@ -294,3 +294,41 @@ Translate the following technical blog post into natural, idiomatic **{target_la
 """
         response = self._generate_content_with_tracking(prompt, model=self.trans_model)
         return response.text.strip()
+
+    def summarize_cves_ko(self, cve_items: list) -> dict:
+        """
+        여러 개의 CVE 영문 설명을 단 1번의 Flash API 호출로 간결하게 한국어 번역/요약합니다.
+        실패하거나 API가 설정되지 않은 경우 빈 딕셔너리({})를 반환하여 알림 전송이 중단되지 않도록 보장합니다.
+        """
+        if not cve_items or not self.trans_model:
+            return {}
+
+        lines = []
+        for item in cve_items:
+            cid = item.get("cve_id", "")
+            desc = (item.get("description_en") or "").strip()
+            if cid and desc:
+                lines.append(f"- {cid}: {desc[:400]}")
+
+        if not lines:
+            return {}
+
+        prompt = (
+            "다음 보안 취약점(CVE) 영문 설명들을 각각 핵심만 1~2문장의 명확한 한국어로 번역해 주세요.\n"
+            "반드시 아래 JSON 형식으로만 출력하세요 (코드블록이나 부연 설명 금지):\n"
+            '{"CVE-YYYY-XXXXX": "한국어 요약 설명", ...}\n\n'
+            + "\n".join(lines)
+        )
+        try:
+            response = self._generate_content_with_tracking(prompt, model=self.trans_model)
+            raw = response.text.strip()
+            if raw.startswith("```"):
+                raw = raw.strip("`").removeprefix("json").strip()
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start != -1 and end != -1:
+                return json.loads(raw[start : end + 1])
+        except Exception as e:
+            logger.warning(f"Failed to batch translate CVE descriptions: {e}")
+        return {}
+

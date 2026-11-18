@@ -14,7 +14,8 @@ SOURCE_FILES = [
     "ai_processor.py",
     "github_uploader.py",
     "dynamo_manager.py",
-    "news_scraper.py"
+    "news_scraper.py",
+    "cve_scraper.py"
 ]
 
 def clean_build():
